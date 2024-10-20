@@ -1,0 +1,516 @@
+const std = @import("std");
+const wxmlp = @import("wikixmlparser.zig");
+
+pub fn main() !void {
+    var stdinBW = std.io.bufferedReader(std.io.getStdIn().reader());
+    const stdin = stdinBW.reader();
+    var stdoutBW = std.io.bufferedWriter(std.io.getStdOut().writer());
+    const stdout = stdoutBW.writer();
+
+    const fbaBuffer = try std.heap.page_allocator.alloc(u8, 4_194_304);
+    defer std.heap.page_allocator.free(fbaBuffer);
+    var fba = std.heap.FixedBufferAllocator.init(fbaBuffer);
+    const fbaAlloc = fba.allocator();
+
+    // stats
+    var total_bytes_read: usize = 0;
+    var total_bytes_written: usize = 0;
+    const n_articles_process = 60_000;
+
+    var i: u32 = 0;
+    while (i < n_articles_process) : (i += 1) {
+        var arena = std.heap.ArenaAllocator.init(fbaAlloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        // const entry = (try stdin.readUntilDelimiterOrEofAlloc(
+        //     alloc,
+        //     2,
+        //     1_000_000,
+        // )) orelse {
+        //     std.debug.print("\nEof Reached, ending stream\n", .{});
+        //     break;
+        // };
+        // total_bytes_read += entry.len - 2;
+
+        //const title_end = std.mem.indexOfPosLinear(u8, entry, 0, &.{1}) orelse @panic("Malformed wikidump, couldn't find \\1 in line");
+
+        //const title = entry[0..title_end];
+        //const article = entry[title_end + 1 ..];
+        const title = "";
+        const article = (try wxmlp.nextPageAlloc(alloc, stdin));
+        total_bytes_read += article.len;
+
+        var processedArticle = SliceArray.init(alloc);
+        try processedArticle.append(article);
+
+        processedArticle.removeSections("<!--", "-->") catch |err| switch (err) {
+            error.UnclosedSection => {}, // TODO: log
+            error.OutOfMemory => return err,
+        };
+        processedArticle.removeSections("<!--", "--") catch |err| switch (err) {
+            error.UnclosedSection => {}, // TODO: log
+            error.OutOfMemory => return err,
+        };
+        processedArticle.removeSections("{{", "}}") catch |err| switch (err) {
+            error.UnclosedSection => {}, // TODO: log
+            error.OutOfMemory => return err,
+        };
+        processedArticle.removeSections("{|", "|}") catch |err| switch (err) {
+            error.UnclosedSection => {}, // TODO: log
+            error.OutOfMemory => return err,
+        };
+
+        total_bytes_written += title.len + processedArticle.len;
+
+        try stdout.writeAll(title);
+        try stdout.writeAll(&.{1});
+        try processedArticle.print(stdout);
+        try stdout.writeAll(&.{2});
+    }
+
+    std.debug.print("Read {d} MB. Avg {d} KB\n", .{
+        @as(f32, @floatFromInt(total_bytes_read)) / 1_000_000.0,
+        @as(f32, @floatFromInt(total_bytes_read)) / @as(f32, @floatFromInt(n_articles_process)) / 1_000.0,
+    });
+    std.debug.print("Wrote {d} MB. Avg {d} KB\n", .{
+        @as(f32, @floatFromInt(total_bytes_written)) / 1_000_000.0,
+        @as(f32, @floatFromInt(total_bytes_written)) / @as(f32, @floatFromInt(n_articles_process)) / 1_000.0,
+    });
+}
+
+/// Write the contents of the next page, reading from the wiki xml dump
+pub fn nextPage(a: std.mem.Allocator, reader: anytype) !?[]const u8 {
+    var array_list = try std.ArrayList(u8).initCapacity(a, 65536);
+    defer array_list.deinit();
+    _ = reader;
+}
+
+/// advances the reader to after the needle in the stream
+pub fn advancePastNeedleOrEof(r: anytype, comptime needle: []const u8) !?void {
+    comptime {
+        if (needle.len < 2) {
+            @compileError("`readUntilNeedleOrEof` for needle size 2 or more.");
+        }
+    }
+
+    while (true) {
+        const b: u8 = r.readByte();
+        if (b == needle[0]) {
+            const nextBytes: u8[needle.len - 1] = undefined;
+            const bytesRead = try r.read(nextBytes);
+            std.debug.assert(bytesRead == needle.len - 2);
+            if (std.mem.eql(u8, nextBytes, needle[1..])) {
+                return;
+            }
+        }
+    }
+
+    return null;
+}
+
+pub const SliceArray = struct {
+    slices: std.ArrayList([]const u8),
+    len: usize,
+    a: std.mem.Allocator,
+
+    pub fn init(a: std.mem.Allocator) SliceArray {
+        return .{
+            .slices = std.ArrayList([]const u8).init(a),
+            .len = 0,
+            .a = a,
+        };
+    }
+
+    pub fn deinit(self: *SliceArray) void {
+        self.slices.deinit();
+    }
+
+    /// Only works in debug
+    pub fn printSlices(self: *const SliceArray) void {
+        for (self.slices.items, 0..) |slice, i| {
+            std.debug.print("Slice: {} \"{s}\"\n", .{ i, slice });
+        }
+    }
+
+    /// Copies slices to single contigous buffer
+    /// You must still deinit() the SliceArray afterwards
+    pub fn toSlice(self: *SliceArray) ![]const u8 {
+        const ownedSlice = try self.a.alloc(u8, self.len);
+
+        var cumulativeSize: usize = 0;
+        for (self.slices.items) |slice| {
+            @memcpy(ownedSlice[cumulativeSize .. cumulativeSize + slice.len], slice);
+            cumulativeSize += slice.len;
+        }
+
+        return ownedSlice;
+    }
+
+    /// Print slices to array
+    pub fn print(self: *SliceArray, w: anytype) !void {
+        for (self.slices.items) |slice| {
+            try w.writeAll(slice);
+        }
+    }
+
+    pub fn append(self: *SliceArray, text: []const u8) !void {
+        try self.slices.append(text);
+        self.len += text.len;
+    }
+
+    /// Remove section without copying
+    /// Start and End must point within an individual slice
+    pub fn remove(self: *SliceArray, start: u32, end: u32) !void {
+        if (end >= self.len) {
+            @panic("Out of bounds access to SliceArray");
+        }
+        if (start >= self.len or start >= end) {
+            @panic("Start is larger than SliceArray size or larger than start index");
+        }
+
+        const target_slice_i = blk: {
+            var cumulativeSize: usize = 0;
+            for (self.slices.items, 0..) |slice, i| {
+                if (cumulativeSize < start and start < (cumulativeSize + slice.len)) {
+                    break :blk i;
+                }
+                cumulativeSize += slice.len;
+            }
+            unreachable;
+        };
+
+        const target_slice = self.slices.items[target_slice_i];
+
+        self.slices.items[target_slice_i] = target_slice[0..start];
+        try self.slices.insert(target_slice_i + 1, target_slice[end..]);
+
+        self.len -= end - start;
+    }
+
+    const RemoveSectionError = error{
+        UnclosedSection,
+        OutOfMemory, // Allocator Error
+    };
+
+    /// Removes all instances [open_token]..[close_token] within the `SliceArray` and handles nesting.
+    ///
+    /// If `fail_on_unclosed` is set to true, then an error is returned for an unclosed section, otherwise the section is ignored.
+    pub fn removeSections(self: *SliceArray, open_token: []const u8, close_token: []const u8) RemoveSectionError!void {
+        if (self.slices.items.len == 0) {
+            return;
+        }
+
+        var slice_idx: u32 = 0;
+        while (slice_idx < self.slices.items.len) : (slice_idx += 1) {
+            const slice = self.slices.items[slice_idx];
+
+            const open_token_start = std.mem.indexOf(u8, slice, open_token) orelse continue;
+            const close_token_end = blk: {
+                var forwardSearchPos = open_token_start + open_token.len;
+                var backwardSearchPos: ?usize = null;
+                while (true) {
+                    const end = (std.mem.indexOfPos(u8, slice, forwardSearchPos, close_token) orelse return RemoveSectionError.UnclosedSection) + close_token.len;
+
+                    const nestedStart = std.mem.lastIndexOf(u8, slice[0 .. backwardSearchPos orelse (end - close_token.len)], open_token) orelse unreachable; // It will find the first token if no others exist
+                    if (nestedStart == open_token_start) {
+                        break :blk end;
+                    } else {
+                        forwardSearchPos = end;
+                        backwardSearchPos = nestedStart;
+                    }
+                }
+            };
+
+            if (open_token_start == 0 and close_token_end == slice.len) { // Section spans entire slice!
+                self.slices.items[slice_idx] = "";
+                self.len -= slice.len;
+            } else if (open_token_start == 0 and close_token_end < slice.len) { // Section starts slice, but doesn't end it
+                self.slices.items[slice_idx] = slice[close_token_end..];
+                self.len -= close_token_end;
+            } else if (open_token_start > 0 and close_token_end == slice.len) { // Section ends slice, but doesn't start it
+                self.slices.items[slice_idx] = slice[0..open_token_start];
+                self.len -= slice.len - open_token_start;
+            } else { // Section neither begins nor ends the slice
+                self.slices.items[slice_idx] = slice[0..open_token_start];
+                try self.slices.insert(slice_idx + 1, slice[close_token_end..]);
+                self.len -= close_token_end - open_token_start;
+            }
+        }
+    }
+};
+
+test "Append" {
+    const test_alloc = std.testing.allocator;
+
+    var sa = SliceArray.init(test_alloc);
+    defer sa.deinit();
+
+    try sa.append("Hello, ");
+    try sa.append("World!");
+
+    const renderedString = try sa.toSlice();
+    defer test_alloc.free(renderedString);
+
+    try std.testing.expectEqualStrings("Hello, World!", renderedString);
+
+    try sa.append("\n");
+
+    const renderedString2 = try sa.toSlice();
+    defer test_alloc.free(renderedString2);
+
+    try std.testing.expectEqualStrings("Hello, World!\n", renderedString2);
+}
+
+test "Remove" {
+    const test_alloc = std.testing.allocator;
+
+    var sa = SliceArray.init(test_alloc);
+    defer sa.deinit();
+
+    try sa.append("Hello, World!");
+
+    try sa.remove(5, 7);
+
+    const renderedString = try sa.toSlice();
+    defer test_alloc.free(renderedString);
+
+    try std.testing.expectEqualStrings("HelloWorld!", renderedString);
+}
+
+test "Remove HTML Comment" {
+    const test_alloc = std.testing.allocator;
+
+    var sa = SliceArray.init(test_alloc);
+    defer sa.deinit();
+
+    try sa.append("<!-- No Comment! -->");
+    try sa.removeSections("<!--", "-->");
+
+    const renderedString = try sa.toSlice();
+    defer test_alloc.free(renderedString);
+
+    try std.testing.expectEqualStrings("", renderedString);
+}
+
+test "Remove Ending HTML Comment" {
+    const test_alloc = std.testing.allocator;
+
+    var sa = SliceArray.init(test_alloc);
+    defer sa.deinit();
+
+    try sa.append(
+        \\Some Content Before
+        \\<!-- No Comment! -->
+    );
+    try sa.removeSections("<!--", "-->");
+
+    const renderedString = try sa.toSlice();
+    defer test_alloc.free(renderedString);
+
+    try std.testing.expectEqualStrings(
+        \\Some Content Before
+        \\
+    ,
+        renderedString,
+    );
+}
+
+test "Remove Starting HTML Comment" {
+    const test_alloc = std.testing.allocator;
+
+    var sa = SliceArray.init(test_alloc);
+    defer sa.deinit();
+
+    try sa.append(
+        \\<!-- No Comment! -->
+        \\Some Content After
+        \\
+    );
+    try sa.removeSections("<!--", "-->");
+
+    const renderedString = try sa.toSlice();
+    defer test_alloc.free(renderedString);
+
+    try std.testing.expectEqualStrings(
+        \\
+        \\Some Content After
+        \\
+    ,
+        renderedString,
+    );
+}
+
+test "Remove Surounded HTML Comment" {
+    const test_alloc = std.testing.allocator;
+
+    var sa = SliceArray.init(test_alloc);
+    defer sa.deinit();
+
+    try sa.append(
+        \\Some Content Before
+        \\<!-- No Comment! -->
+        \\Some Content After
+    );
+    try sa.removeSections("<!--", "-->");
+
+    const renderedString = try sa.toSlice();
+    defer test_alloc.free(renderedString);
+
+    try std.testing.expectEqualStrings(
+        \\Some Content Before
+        \\
+        \\Some Content After
+    ,
+        renderedString,
+    );
+}
+
+test "Remove wikicode tag" {
+    var sa = SliceArray.init(std.testing.allocator);
+    defer sa.deinit();
+
+    try sa.append(
+        \\Some Content Before
+        \\{{Cite [some bloated wikicode tag]}}
+        \\Some Content After
+    );
+
+    try sa.removeSections("{{", "}}");
+
+    const renderedString = try sa.toSlice();
+    defer std.testing.allocator.free(renderedString);
+
+    try std.testing.expectEqualStrings(
+        \\Some Content Before
+        \\
+        \\Some Content After
+    ,
+        renderedString,
+    );
+}
+
+test "Remove Sections errors on unclosed" {
+    var sa = SliceArray.init(std.testing.allocator);
+    defer sa.deinit();
+
+    try sa.append(
+        \\Some Content Before
+        \\{{Cite [some bloated wik
+        \\Some Content After
+    );
+
+    const ret = sa.removeSections("{{", "}}");
+    try std.testing.expectError(SliceArray.RemoveSectionError.UnclosedSection, ret);
+
+    const renderedString = try sa.toSlice();
+    defer std.testing.allocator.free(renderedString);
+
+    try std.testing.expectEqualStrings(
+        \\Some Content Before
+        \\{{Cite [some bloated wik
+        \\Some Content After
+    ,
+        renderedString,
+    );
+}
+
+test "Removes Trivial Nested Sections" {
+    var sa = SliceArray.init(std.testing.allocator);
+    defer sa.deinit();
+
+    try sa.append(
+        \\Before Content
+        \\{{Cite [some content] {{Cite [some nested content]}} }}
+        \\After Content
+    );
+
+    try sa.removeSections("{{", "}}");
+
+    const renderedString = try sa.toSlice();
+    defer std.testing.allocator.free(renderedString);
+
+    try std.testing.expectEqualStrings(
+        \\Before Content
+        \\
+        \\After Content
+    ,
+        renderedString,
+    );
+}
+
+// Not used anymore
+// pub const RawArticle = struct {
+//     title: []const u8,
+//     article: []const u8,
+//
+//     /// Unnecsary with new wikidump format
+//     /// Makes two new slices for the title(key) and article(value) fields in the JSON.
+//     /// This is faster than doing naive JSON parsing for each line.
+//     pub fn fromJSON(json: []const u8) RawArticle {
+//         const title_start = 2;
+//         const title_end = std.mem.indexOfPos(u8, json, 2, "\"") orelse @panic("Malformed json!");
+//         const title: []const u8 = json[title_start..title_end];
+//
+//         const article_start = title_end + 4;
+//         const article_end = json.len - 2;
+//         const article: []const u8 = json[article_start..article_end];
+//
+//         return .{
+//             .title = title,
+//             .article = article,
+//         };
+//     }
+// };
+//
+// pub fn removeHTMLComments(self: *SliceArray) !void {
+//         if (self.slices.items.len == 0) {
+//             return;
+//         }
+//
+//         // Iterate through slices
+//         // For each slice
+//         // Find comment
+//         // replace the comment with two new slices, advance the pointer
+//         // advance the pointer
+//         var slice_i: u32 = 0;
+//         while (slice_i < self.slices.items.len) : (slice_i += 1) {
+//             const slice = self.slices.items[slice_i];
+//
+//             const comment_start = std.mem.indexOf(u8, slice, "<!--") orelse break;
+//             const comment_end = (std.mem.indexOfPos(u8, slice, comment_start + "<!--".len, "-->") orelse @panic("html element not closed!")) + "-->".len;
+//
+//             if (comment_start == 0 and comment_end == slice.len) { // Comment spans entire slice!
+//                 self.slices.items[slice_i] = "";
+//                 self.len -= slice.len;
+//             } else if (comment_start == 0 and comment_end < slice.len) { // Comment starts slice, but doesn't end it
+//                 self.slices.items[slice_i] = slice[comment_end..];
+//                 self.len -= comment_end;
+//             } else if (comment_start > 0 and comment_end == slice.len) { // Comment ends slice, but doesn't start it
+//                 self.slices.items[slice_i] = slice[0..comment_start];
+//                 self.len -= slice.len - comment_start;
+//             } else { // Comment neither begins nor ends the slice
+//                 self.slices.items[slice_i] = slice[0..comment_start];
+//                 try self.slices.insert(slice_i + 1, slice[comment_end..]);
+//                 self.len -= comment_end - comment_start;
+//             }
+//         }
+//     }
+
+// old
+// const maybeEnd = std.mem.indexOfPos(u8, slice, open_token_start + open_token.len, close_token);
+// if (maybeEnd == null) {
+//     //if (fail_on_unclosed) {
+//     return RemoveSectionError.UnclosedSection;
+//     //} else {
+//     //    continue;
+//     //}
+// }
+// const end = (maybeEnd orelse unreachable) + close_token.len;
+
+// if (end < slice.len) { // there could be a trailing newline to catch!
+//     if (slice[end] == '\n') {
+//         break :blk end + 1;
+//     }
+// }
+// break :blk end;
