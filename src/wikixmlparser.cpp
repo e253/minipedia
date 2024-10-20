@@ -48,24 +48,3 @@ WikiParseResult cParsePage(const char* rawXmlEntry)
         textNode->value_size(),
     };
 }
-
-// int main()
-// {
-//     auto redirectXml = std::string("<page><redirect title=\"Blah\" />#REDIRECT</page>");
-//     WikiParseResult wpr = parsePage(redirectXml.c_str());
-//     if (wpr.is_redirect)
-//         std::cout << "redirect!" << std::endl;
-//     else
-//         std::cout << "not redirect" << std::endl;
-//     write(0, wpr.page_content, wpr.page_content_size);
-//     std::cout << "\n\n";
-//
-//     auto articleXml = std::string("<page>Hello, World!</page>");
-//     WikiParseResult wpr1 = parsePage(articleXml.c_str());
-//     if (wpr1.is_redirect)
-//         std::cout << "redirect!" << std::endl;
-//     else
-//         std::cout << "not redirect" << std::endl;
-//     write(0, wpr1.page_content, wpr1.page_content_size);
-//     std::cout << "\n\n";
-// }
