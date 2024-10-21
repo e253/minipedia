@@ -1,0 +1,20 @@
+.{
+    .name = "minipedia",
+    .version = "0.0.1",
+    .minimum_zig_version = "0.13.0",
+
+    .dependencies = .{
+        .rapidxml = .{
+            .url = "https://netactuate.dl.sourceforge.net/project/rapidxml/rapidxml/rapidxml%201.13/rapidxml-1.13.zip?viasf=1",
+            .hash = "122005ad74a220f078acd8ad3cad706c4c70c7f989370906fa0f8921d8779622af2c",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        ".gitignore",
+    },
+}

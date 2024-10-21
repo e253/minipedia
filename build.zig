@@ -4,6 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const rxml = b.dependency("rapidxml", .{});
+
     const exe = b.addExecutable(.{
         .name = "main",
         .root_source_file = b.path("src/main.zig"),
@@ -11,6 +13,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe.addCSourceFile(.{ .file = b.path("src/wikixmlparser.cpp") });
+    exe.addIncludePath(rxml.path(""));
     exe.addIncludePath(b.path("src"));
     exe.linkLibC();
     exe.linkLibCpp();
@@ -28,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wikiparserxml_tests.addCSourceFile(.{ .file = b.path("src/wikixmlparser.cpp") });
+    wikiparserxml_tests.addIncludePath(rxml.path(""));
     wikiparserxml_tests.addIncludePath(b.path("src"));
     wikiparserxml_tests.linkLibC();
     wikiparserxml_tests.linkLibCpp();
