@@ -32,6 +32,7 @@ pub fn main() !void {
     };
     var n_articles_processed: usize = 0;
     var n_redirects_skipped: usize = 0;
+    var n_low_value_articles_skipped: usize = 0;
 
     while (true) {
         var arena = std.heap.ArenaAllocator.init(fbaAlloc);
@@ -51,6 +52,11 @@ pub fn main() !void {
         };
 
         const title = wikiArticle.title;
+        if (std.mem.indexOfPosLinear(u8, title, 0, "isambiguation") != null) {
+            n_low_value_articles_skipped += 1;
+            continue;
+        }
+
         const article = wikiArticle.article;
         total_article_bytes_read += article.len;
 
@@ -119,6 +125,7 @@ pub fn main() !void {
         @as(f32, @floatFromInt(total_bytes_written)) / @as(f32, @floatFromInt(n_articles_to_process)) / 1_000.0,
     });
     std.debug.print("Processed {} articles, skipped {} articles\n", .{ n_articles_processed, n_redirects_skipped });
+    std.debug.print("Skipped {} low value articles\n", .{n_low_value_articles_skipped});
     const end_time = std.time.milliTimestamp();
     const t_in_s = @divFloor((end_time - start_time), 1000);
     std.debug.print("{} min {} sec\n", .{ @divFloor(t_in_s, 60), @mod(t_in_s, 60) });

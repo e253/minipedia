@@ -8,6 +8,10 @@
             .url = "https://netactuate.dl.sourceforge.net/project/rapidxml/rapidxml/rapidxml%201.13/rapidxml-1.13.zip?viasf=1",
             .hash = "122005ad74a220f078acd8ad3cad706c4c70c7f989370906fa0f8921d8779622af2c",
         },
+        .xz_tools = .{
+            .url = "https://github.com/tukaani-project/xz/archive/refs/tags/v5.6.3.tar.gz",
+            .hash = "122064f114c207a48c75c9208e6f2e5da19edc13778eb54ac87177b1bebef7c544f1",
+        },
     },
 
     .paths = .{

@@ -1,7 +1,5 @@
 #include "wikixmlparser.h"
 #include "rapidxml.hpp"
-#include <iostream>
-#include <string>
 #include <unistd.h>
 
 #define PARSE_PAGE_ERROR { false, nullptr, 0, nullptr, 0 }
