@@ -26,6 +26,13 @@ WikiParseResult cParsePage(const char* rawXmlEntry)
         is_redirect = true;
     }
 
+    // we only want 'mainspace' or ns='0' articles
+    rapidxml::xml_node<>* namespaceNode = pageNode->first_node("ns");
+    if (!namespaceNode)
+        return PARSE_PAGE_ERROR;
+    if (namespaceNode->value()[0] != '0')
+        return PARSE_PAGE_ERROR;
+
     rapidxml::xml_node<>* titleNode = pageNode->first_node("title");
     if (!titleNode)
         return PARSE_PAGE_ERROR;

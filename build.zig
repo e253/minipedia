@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath(b.path("src"));
     exe.linkLibC();
     exe.linkLibCpp();
+    exe.linkSystemLibrary("lzma");
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

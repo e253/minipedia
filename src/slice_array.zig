@@ -38,6 +38,15 @@ pub const SliceArray = struct {
         return ownedSlice;
     }
 
+    /// Copies slices to externally allocated buffer `out`
+    pub fn writeToSlice(self: *SliceArray, out: []u8) !void {
+        var i: usize = 0;
+        for (self.slices.items) |slice| {
+            @memcpy(out[i .. i + slice.len], slice);
+            i += slice.len;
+        }
+    }
+
     /// Print slices to array
     pub fn print(self: *SliceArray, w: anytype) !void {
         for (self.slices.items) |slice| {
