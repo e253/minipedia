@@ -31,10 +31,10 @@ pub const ExternalLinkCtx = struct {
 
 pub const HeadingCtx = struct {
     heading: []const u8,
-    level: u8,
+    level: usize,
 };
 
-pub const WikiPage = struct {
+pub const MWParser = struct {
     /// Contains list of nodes which will eventually contain parsed information
     nodes: std.ArrayList(MWNode),
     raw_wikitext: []const u8,
@@ -54,6 +54,8 @@ pub const WikiPage = struct {
 
     const ParseError = error{
         IncompleteArgument,
+        IncompleteHeading,
+        IncompleteHtmlEntity,
     };
 
     /// iterates through characters and dispatches to node specific parsing functions
@@ -72,9 +74,6 @@ pub const WikiPage = struct {
                         }
 
                         i = try self.parseArgument(i);
-                        if (i == self.raw_wikitext.len) {
-                            break;
-                        }
 
                         cur_text_node = self.raw_wikitext[i..];
                         cur_text_node.len = 0;
@@ -86,6 +85,7 @@ pub const WikiPage = struct {
                         // table
                         i += 1;
                     } else {
+                        cur_text_node.len += 1;
                         i += 1;
                     }
                 },
@@ -97,8 +97,6 @@ pub const WikiPage = struct {
                     } else {
                         // external link
                     }
-
-                    i += 1;
                 },
 
                 // html entity that could be &lt;
@@ -106,23 +104,38 @@ pub const WikiPage = struct {
                     if (nextEql(self.raw_wikitext, "&lt;", i)) {
                         if (nextEql(self.raw_wikitext, "!--", i + "&lt;".len)) {
                             // skip html comment
+                            i += 1;
                         } else {
                             // parse html tag
+                            i += 1;
                         }
                     } else {
-                        // parse html entity
-                    }
+                        // places entity in text becuase I suspect the failure could false trigger on regular text
+                        if (cur_text_node.len > 0) {
+                            try self.nodes.append(.{ .text = cur_text_node });
+                        }
 
-                    i += 1;
+                        i = try self.parseHtmlEntity(i);
+
+                        cur_text_node = self.raw_wikitext[i..];
+                        cur_text_node.len = 0;
+                    }
                 },
 
                 // headings
                 '=' => {
-                    if (nextEql(self.raw_wikitext, "==", i)) {
-                        // parse heading
+                    // article or line start with an equals is expected to be a heading
+                    if (i == 0 or (i > 0 and self.raw_wikitext[i - 1] == '\n')) {
+                        if (cur_text_node.len > 0) {
+                            try self.nodes.append(.{ .text = cur_text_node });
+                        }
+                        i = try self.parseHeading(i);
+                        cur_text_node = self.raw_wikitext[i..];
+                        cur_text_node.len = 0;
+                    } else {
+                        cur_text_node.len += 1;
+                        i += 1;
                     }
-
-                    i += 1;
                 },
 
                 // continue adding to text node
@@ -136,6 +149,100 @@ pub const WikiPage = struct {
         if (cur_text_node.len > 0) {
             try self.nodes.append(.{ .text = cur_text_node });
         }
+    }
+
+    /// attempts to find html entity from '&' start character
+    ///
+    /// Returns `null` if not found
+    fn parseHtmlEntity(self: *Self, start: usize) !usize {
+        var i: usize = start + 1;
+
+        if (self.raw_wikitext[i] == '#') {
+            i += 1;
+            // numeric, at least 2-4 digits
+            var n_digits: usize = 0;
+            while (i < self.raw_wikitext.len) : (i += 1) {
+                const ch = self.raw_wikitext[i];
+                if (ch == ';') {
+                    if (2 <= n_digits and n_digits <= 4) {
+                        try self.nodes.append(.{ .html_entity = self.raw_wikitext[start .. i + 1] });
+                        return i + 1;
+                    } else {
+                        return ParseError.IncompleteHtmlEntity;
+                    }
+                }
+
+                if (ch < 48 or ch > 57) {
+                    return ParseError.IncompleteHtmlEntity;
+                } else {
+                    n_digits += 1;
+                }
+            }
+        } else {
+            while (i < self.raw_wikitext.len) : (i += 1) {
+                const ch = self.raw_wikitext[i];
+                if (ch == ';') {
+                    try self.nodes.append(.{ .html_entity = self.raw_wikitext[start .. i + 1] });
+                    return i + 1;
+                }
+            }
+        }
+
+        return ParseError.IncompleteHtmlEntity;
+    }
+
+    fn parseHeading(self: *Self, start: usize) !usize {
+        var i: usize = start;
+        var level: usize = 0;
+        while (i < self.raw_wikitext.len) : (i += 1) {
+            const ch = self.raw_wikitext[i];
+            switch (ch) {
+                '=' => level += 1,
+                '\n' => return ParseError.IncompleteHeading,
+                else => break,
+            }
+        }
+        if (i == self.raw_wikitext.len) {
+            return ParseError.IncompleteHeading;
+        }
+
+        const text_start = i; // we assume one space
+        var text_size: usize = 0;
+        while (i < self.raw_wikitext.len) : (i += 1) {
+            const ch = self.raw_wikitext[i];
+            switch (ch) {
+                '=' => break,
+                '\n' => return ParseError.IncompleteHeading,
+                else => text_size += 1,
+            }
+        }
+        if (i == self.raw_wikitext.len) {
+            return ParseError.IncompleteHeading;
+        }
+
+        var _level = level;
+
+        while (i < self.raw_wikitext.len) : (i += 1) {
+            if (_level == 0) { // avoid overflow
+                break;
+            }
+
+            const ch = self.raw_wikitext[i];
+            switch (ch) {
+                '=' => _level -= 1,
+                else => break,
+            }
+        }
+        if (i == self.raw_wikitext.len or _level != 0) {
+            return ParseError.IncompleteHeading;
+        }
+        if (self.raw_wikitext[i] != '\n') {
+            return ParseError.IncompleteHeading;
+        }
+
+        try self.nodes.append(.{ .heading = .{ .heading = self.raw_wikitext[text_start .. text_start + text_size], .level = level } });
+
+        return i + 1; // push past newline
     }
 
     /// Returns size of the node
@@ -167,7 +274,7 @@ pub const WikiPage = struct {
 /// returns `true` if the needle is present starting at i.
 ///
 /// `false` if out of bounds
-fn nextEql(buf: []const u8, needle: []const u8, i: usize) bool {
+inline fn nextEql(buf: []const u8, needle: []const u8, i: usize) bool {
     if (i + needle.len < buf.len) {
         return std.mem.eql(u8, buf[i..][0..needle.len], needle);
     }
@@ -193,10 +300,10 @@ test "Errors on unclosed Argument" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = WikiPage.init(a, wikitext);
+    var wp = MWParser.init(a, wikitext);
 
     const e = wp.parse();
-    try std.testing.expectError(WikiPage.ParseError.IncompleteArgument, e);
+    try std.testing.expectError(MWParser.ParseError.IncompleteArgument, e);
 }
 
 test "Parses Well Formed Argument With Some Text" {
@@ -210,7 +317,7 @@ test "Parses Well Formed Argument With Some Text" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = WikiPage.init(a, wikitext);
+    var wp = MWParser.init(a, wikitext);
     try wp.parse();
 
     try std.testing.expect(wp.nodes.items.len == 3);
@@ -232,5 +339,116 @@ test "Parses Well Formed Argument With Some Text" {
     switch (wp.nodes.items[2]) {
         .text => |text| try std.testing.expectEqualStrings("\nSome more text\n", text),
         else => unreachable,
+    }
+}
+
+test "Rejects Various Malformed Headings" {
+    const unclosed1: []const u8 =
+        \\== Anarchism
+        \\
+    ;
+    const unclosed2: []const u8 =
+        \\== Anarchism=
+        \\
+    ;
+    const overclosed: []const u8 =
+        \\== Anarchism===
+        \\
+    ;
+    const bad_line_break: []const u8 =
+        \\== Anarchism
+        \\==
+        \\
+    ;
+    const wierd: []const u8 =
+        \\= = =
+        \\
+    ;
+    const cases = [_][]const u8{ unclosed1, unclosed2, overclosed, bad_line_break, wierd };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var wp = MWParser.init(a, case);
+        const e = wp.parse();
+        try std.testing.expectError(MWParser.ParseError.IncompleteHeading, e);
+    }
+}
+
+test "Parses Well Formed Heading With Some Text" {
+    const wikitext =
+        \\= Blah Blah Blah =
+        \\Blah Blah Blah
+        \\Some more Blah
+        \\
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 2);
+
+    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[0]), "heading");
+    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[1]), "text");
+
+    switch (wp.nodes.items[0]) {
+        .heading => |h| {
+            try std.testing.expectEqualStrings(" Blah Blah Blah ", h.heading);
+            try std.testing.expect(h.level == 1);
+        },
+        else => unreachable,
+    }
+
+    switch (wp.nodes.items[1]) {
+        .text => |text| try std.testing.expectEqualStrings("Blah Blah Blah\nSome more Blah\n", text),
+        else => unreachable,
+    }
+}
+
+test "Rejects various malformed html entities" {
+    const non_numerical_num: []const u8 = "&#hello;";
+    const too_many_digits: []const u8 = "&#12345;";
+    const too_few_digits: []const u8 = "&#1;";
+    const unclosed: []const u8 = "&hello";
+
+    const cases = [_][]const u8{ non_numerical_num, too_many_digits, too_few_digits, unclosed };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        var wp = MWParser.init(a, case);
+        const e = wp.parse();
+        try std.testing.expectError(MWParser.ParseError.IncompleteHtmlEntity, e);
+    }
+}
+
+test "Correctly Parses HTML Entity" {
+    const big_num: []const u8 = "&#1234;";
+    const sm_num: []const u8 = "&#11;";
+    const s_one: []const u8 = "&hello;";
+    const s_two: []const u8 = "&quot;";
+
+    const entities = [_][]const u8{ big_num, sm_num, s_one, s_two };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, big_num ++ sm_num ++ s_one ++ s_two);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 4);
+    for (0..4) |i| {
+        switch (wp.nodes.items[i]) {
+            .html_entity => |he| try std.testing.expectEqualStrings(entities[i], he),
+            else => unreachable,
+        }
     }
 }
