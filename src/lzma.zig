@@ -194,7 +194,10 @@ pub fn compress(a_opt: ?*const std.mem.Allocator, in: []const u8, out: []u8) ![]
     return out[0 .. out.len - s.avail_out];
 }
 
-pub fn decompress(a_opt: ?*const std.mem.Allocator, in: []const u8, out: []u8) ![]u8 {
+/// This will decode the XZ block that the `GenericReader` `in` is pointing to
+///
+/// `out` must be large enough to hold the decompressed block or else UB
+pub fn decompress(a_opt: ?*const std.mem.Allocator, in: anytype, out: []u8) ![]u8 {
     var s = stream_init();
 
     if (a_opt) |a| {
@@ -203,12 +206,33 @@ pub fn decompress(a_opt: ?*const std.mem.Allocator, in: []const u8, out: []u8) !
 
     try stream_decoder(&s);
 
-    s.next_in = @constCast(in.ptr);
-    s.avail_in = in.len;
+    var inbuf: [4096]u8 = undefined;
+
+    s.next_in = null;
+    s.avail_in = 0;
     s.next_out = out.ptr;
     s.avail_out = out.len;
 
-    std.debug.assert(try execute(&s, .finish) == .StreamEnd);
+    var action: Action = .run;
+
+    while (true) {
+        if (s.avail_in == 0) { // the buffer is exhausted and we need to read more!
+            s.next_in = &inbuf;
+            s.avail_in = blk: {
+                const bytes_in = try in.read(&inbuf);
+                if (bytes_in < inbuf.len) { // eof
+                    action = .finish;
+                }
+                break :blk bytes_in;
+            };
+        }
+
+        const ret = try execute(&s, action);
+
+        if (ret == .StreamEnd) { // we are done!
+            break;
+        }
+    }
 
     end(&s);
 
@@ -241,10 +265,12 @@ test "Hello, World! Decompress" {
     const alloc = arena.allocator();
 
     const in = [_]u8{ 0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x0, 0x0, 0x1, 0x69, 0x22, 0xde, 0x36, 0x02, 0x00, 0x21, 0x01, 0x1c, 0x00, 0x00, 0x00, 0x10, 0xcf, 0x58, 0xcc, 0x01, 0x00, 0x0c, 0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x2c, 0x20, 0x57, 0x6f, 0x72, 0x6c, 0x64, 0x21, 0x0, 0x0, 0x0, 0x0, 0xd0, 0xc3, 0x4a, 0xec, 0x0, 0x1, 0x21, 0xd, 0x75, 0xdc, 0xa8, 0xd2, 0x90, 0x42, 0x99, 0x0d, 0x1, 0x0, 0x0, 0x0, 0x0, 0x1, 0x59, 0x5a };
+    var in_fbs_stream = std.io.fixedBufferStream(&in);
+    const in_reader = in_fbs_stream.reader();
     var out = try alloc.alloc(u8, 256);
     const expected: []const u8 = "Hello, World!";
 
-    out = try decompress(&alloc, &in, out);
+    out = try decompress(&alloc, in_reader, out);
 
     try std.testing.expectEqualStrings(expected, out);
 }

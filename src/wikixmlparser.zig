@@ -79,6 +79,7 @@ test "Trivial Correct Page" {
     const correctPage =
         \\<page>
         \\<title>Correct</title>
+        \\<ns>0</ns>
         \\<revision>
         \\<text>Some Text!</text>
         \\</revision>

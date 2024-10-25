@@ -1,6 +1,7 @@
 #include "wikixmlparser.h"
 #include "rapidxml.hpp"
 #include <unistd.h>
+// #include <iostream>
 
 #define PARSE_PAGE_ERROR { false, nullptr, 0, nullptr, 0 }
 
@@ -11,7 +12,8 @@ WikiParseResult cParsePage(const char* rawXmlEntry)
     try {
         doc.parse<rapidxml::parse_fastest>((char*)rawXmlEntry);
     } catch (const std::exception& e) {
-        // TODO: Log error!
+        // std::cerr << "XML parse error" << std::endl;
+        // std::cerr << e.what() << std::endl;
         return PARSE_PAGE_ERROR;
     }
 
@@ -28,10 +30,14 @@ WikiParseResult cParsePage(const char* rawXmlEntry)
 
     // we only want 'mainspace' or ns='0' articles
     rapidxml::xml_node<>* namespaceNode = pageNode->first_node("ns");
-    if (!namespaceNode)
+    if (!namespaceNode) {
+        // std::cerr << "No namespace found" << std::endl;
         return PARSE_PAGE_ERROR;
-    if (namespaceNode->value()[0] != '0')
+    }
+    if (namespaceNode->value()[0] != '0') {
+        // std::cerr << "Namespace " << namespaceNode->value()[0] << " found" << std::endl;
         return PARSE_PAGE_ERROR;
+    }
 
     rapidxml::xml_node<>* titleNode = pageNode->first_node("title");
     if (!titleNode)

@@ -15,18 +15,18 @@ pub fn main() !void {
     const out = out_file.writer();
     defer out_file.close();
 
-    {
-        var zero_buf: [100_000]u8 = undefined;
-        @memset(&zero_buf, 0);
-        inline for (0..150) |_| {
-            try out.writeAll(&zero_buf);
-        }
-    }
-
     const fbaBuffer = try std.heap.c_allocator.alloc(u8, 1_609_780_728);
     defer std.heap.c_allocator.free(fbaBuffer);
     var fba = std.heap.FixedBufferAllocator.init(fbaBuffer);
     const fbaAlloc = fba.allocator();
+
+    // Write 15MB of 0s
+    const tmp_zero_buf = try fbaAlloc.alloc(u8, 100_000);
+    @memset(tmp_zero_buf, 0);
+    inline for (0..150) |_| {
+        try out.writeAll(tmp_zero_buf);
+    }
+    fbaAlloc.free(tmp_zero_buf);
 
     // Stats
     var total_bytes_read: usize = 0;
@@ -46,6 +46,7 @@ pub fn main() !void {
     // Block
     var block_id: u16 = 0;
     var lzma_block_size: usize = 0;
+    var lzma_last_block_size: usize = 0; // we need to know how large the last block was to create an offset for the current one
     const lzma_block_size_limit: usize = 1_000_000;
     var lzma_block_accum_buffer = try std.heap.c_allocator.alloc(u8, lzma_block_size_limit);
     defer std.heap.c_allocator.free(lzma_block_accum_buffer);
@@ -106,14 +107,19 @@ pub fn main() !void {
             error.UnclosedSection => {}, // TODO: log
             error.OutOfMemory => return err,
         };
+        processedArticle.removeSections("&lt;ref", "&lt;/ref&gt;") catch |err| switch (err) {
+            error.UnclosedSection => {}, // TODO: log
+            error.OutOfMemory => return err,
+        };
+        processedArticle.removeSections("&lt;ref", "/&gt;") catch |err| switch (err) {
+            error.UnclosedSection => {}, // TODO: log
+            error.OutOfMemory => return err,
+        };
         processedArticle.removeSections("{{", "}}") catch |err| switch (err) {
             error.UnclosedSection => {}, // TODO: log
             error.OutOfMemory => return err,
         };
-        processedArticle.removeSections("&lt;ref&gt;", "&lt;/ref&gt;") catch |err| switch (err) {
-            error.UnclosedSection => {}, // TODO: log
-            error.OutOfMemory => return err,
-        };
+
         try processedArticle.findAndReplace("''''", "***");
         try processedArticle.findAndReplace("'''", "**");
         try processedArticle.findAndReplace("''", "*");
@@ -121,27 +127,37 @@ pub fn main() !void {
 
         // block is full! compress contents and flush them out
         // add a block_offset to the array
-        if (lzma_block_size + processedArticle.len + title.len + 2 >= lzma_block_size_limit) {
+        if (lzma_block_size + processedArticle.len + title.len + 12 >= lzma_block_size_limit) {
             const compressed_output = try lzma.compress(&alloc, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
-            try out.writeAll(compressed_output); // TODO change to output file
-            lzma_block_size = 0;
-            total_bytes_written += compressed_output.len;
+            try out.writeAll(compressed_output);
 
             if (block_offsets.items.len == 0) {
-                try block_offsets.append(0);
+                try block_offsets.append(15_000_000);
             } else {
-                try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + compressed_output.len);
+                try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + lzma_last_block_size);
             }
 
+            lzma_last_block_size = compressed_output.len;
+            lzma_block_size = 0;
+            total_bytes_written += compressed_output.len;
             block_id += 1;
         }
 
-        // Schedule contents for accumulation buffer
+        // Copy contents to accumulation buffer
+        var article_id_bytes: [8]u8 = undefined;
+        std.mem.writeInt(usize, &article_id_bytes, n_articles_processed, .big);
+        @memcpy(lzma_block_accum_buffer[lzma_block_size .. lzma_block_size + 8], &article_id_bytes);
+        lzma_block_size += 8;
+        @memcpy(lzma_block_accum_buffer[lzma_block_size .. lzma_block_size + "# ".len], "# ");
+        lzma_block_size += 2;
+        @memcpy(lzma_block_accum_buffer[lzma_block_size .. lzma_block_size + title.len], title);
+        lzma_block_size += title.len;
+        lzma_block_accum_buffer[lzma_block_size] = '\n';
+        lzma_block_size += 1;
         try processedArticle.writeToSlice(lzma_block_accum_buffer[lzma_block_size..]);
-        lzma_block_accum_buffer[lzma_block_size + processedArticle.len] = 1;
-        @memcpy(lzma_block_accum_buffer[lzma_block_size + processedArticle.len + 1 .. lzma_block_size + processedArticle.len + 1 + title.len], title);
-        lzma_block_accum_buffer[lzma_block_size + processedArticle.len + title.len + 2] = 2;
-        lzma_block_size += processedArticle.len + title.len + 2;
+        lzma_block_size += processedArticle.len;
+        lzma_block_accum_buffer[lzma_block_size] = 0;
+        lzma_block_size += 1;
 
         // Write down what block this article is in
         try article_id_block_id_map.append(block_id);
@@ -157,6 +173,12 @@ pub fn main() !void {
         try out.writeAll(compressed_output);
         lzma_block_size = 0;
         total_bytes_written += compressed_output.len;
+
+        if (block_offsets.items.len == 0) {
+            try block_offsets.append(15_000_000);
+        } else {
+            try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + lzma_last_block_size);
+        }
     }
 
     // Write prelude and header
@@ -166,15 +188,15 @@ pub fn main() !void {
 
     try out_file.seekTo(header_start);
     const header_out_writer = out_file.writer();
-    try header_out_writer.writeInt(u64, block_offsets.items.len, .big);
-    try header_out_writer.writeInt(u64, article_id_block_id_map.items.len, .big);
+    try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(block_offsets.items).len, .big);
+    try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(article_id_block_id_map.items).len, .big);
     try header_out_writer.writeAll(std.mem.sliceAsBytes(block_offsets.items));
     try header_out_writer.writeAll(std.mem.sliceAsBytes(article_id_block_id_map.items));
     std.debug.assert((try out_file.getPos()) == 15_000_000);
 
     try out_file.seekTo(0);
     const prelude_out_writer = out_file.writer();
-    try prelude_out_writer.writeAll("MINIPEDIA"); // magic
+    try prelude_out_writer.writeAll("MINIDUMP"); // Magic
     try prelude_out_writer.writeInt(u64, 0, .big); // Version
     try prelude_out_writer.writeInt(u64, header_start, .big); // Header Start
 
@@ -183,7 +205,7 @@ pub fn main() !void {
         @as(f32, @floatFromInt(total_bytes_read)) / 1_000_000.0,
         @as(f32, @floatFromInt(total_article_bytes_read)) / @as(f32, @floatFromInt(n_articles_to_process)) / 1_000.0,
     });
-    std.debug.print("Wrote {d} MB. Avg article len {d} KB\n", .{
+    std.debug.print("Wrote 15 + {d} MB. Avg article len {d} KB\n", .{
         @as(f32, @floatFromInt(total_bytes_written)) / 1_000_000.0,
         @as(f32, @floatFromInt(total_bytes_written)) / @as(f32, @floatFromInt(n_articles_to_process)) / 1_000.0,
     });
@@ -216,6 +238,7 @@ pub const Args = struct {
         const argv0 = sT(std.os.argv[0], 0);
 
         if (std.os.argv.len == 1) {
+            std.debug.print("processing articles until eof\n", .{});
             return .{};
         }
 
@@ -226,6 +249,8 @@ pub const Args = struct {
                 std.debug.print(help, .{argv0});
                 return ParseError.Help;
             }
+
+            std.debug.print("processing articles until eof\n", .{});
 
             return .{
                 .out_file_name = argv1,

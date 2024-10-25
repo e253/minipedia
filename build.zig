@@ -20,6 +20,16 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("lzma");
     b.installArtifact(exe);
 
+    const get_article = b.addExecutable(.{
+        .name = "get_article",
+        .root_source_file = b.path("src/get_article.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    get_article.linkLibC();
+    get_article.linkSystemLibrary("lzma");
+    b.installArtifact(get_article);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run the app");
