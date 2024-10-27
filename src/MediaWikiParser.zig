@@ -178,73 +178,75 @@ pub const MWParser = struct {
     ///
     /// TODO: handle nesting. Errors right now!
     fn parseHtmlTag(self: *Self, start: usize) !usize {
-        var i = try advance(start, "<".len, self.raw_wikitext);
+        const FAIL = ParseError.InvalidHtmlTag;
+
+        var i = try advance(start, "<".len, self.raw_wikitext, FAIL);
         if (isWhiteSpace(self.raw_wikitext[i]))
-            return ParseError.InvalidHtmlTag;
+            return FAIL;
 
         const tag_name_start = i;
-        i = skip(self.raw_wikitext, node_name_pred, i) orelse return ParseError.InvalidHtmlTag;
+        i = try skip(self.raw_wikitext, node_name_pred, i, FAIL);
         if (i == tag_name_start)
-            return ParseError.InvalidHtmlTag;
+            return FAIL;
         const tag_name = self.raw_wikitext[tag_name_start..i];
 
-        i = skip(self.raw_wikitext, whitespace_pred, i) orelse return ParseError.InvalidHtmlTag;
+        i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
 
         // attempt to find attributes
         var attrs = std.ArrayList(HtmlTagCtx.HtmlTagAttr).init(self.a);
         while (attribute_name_pred(self.raw_wikitext[i])) {
             if (i >= self.raw_wikitext.len)
-                return ParseError.InvalidHtmlTag;
+                return FAIL;
 
             // extract attr name
             const attr_name_start = i;
-            i = skip(self.raw_wikitext, attribute_name_pred, i) orelse return ParseError.InvalidHtmlTag;
+            i = try skip(self.raw_wikitext, attribute_name_pred, i, FAIL);
             if (attr_name_start == i)
-                return ParseError.InvalidHtmlTag;
+                return FAIL;
             const attr_name = self.raw_wikitext[attr_name_start..i];
 
             // skip whitespace after attr name
-            i = skip(self.raw_wikitext, whitespace_pred, i) orelse return ParseError.InvalidHtmlTag;
+            i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
 
             // skip '='
             if (self.raw_wikitext[i] != '=')
-                return ParseError.InvalidHtmlTag;
-            i = try advance(i, "=".len, self.raw_wikitext);
+                return FAIL;
+            i = try advance(i, "=".len, self.raw_wikitext, FAIL);
 
             // skip whitespace after =
-            i = skip(self.raw_wikitext, whitespace_pred, i) orelse return ParseError.InvalidHtmlTag;
+            i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
 
             // skip quote and remember if it was ' or "
             const quote = self.raw_wikitext[i];
             if (i + 1 == self.raw_wikitext.len or (quote != '\'' and quote != '"'))
-                return ParseError.InvalidHtmlTag;
-            i = try advance(i, 1, self.raw_wikitext);
+                return FAIL;
+            i = try advance(i, 1, self.raw_wikitext, FAIL);
 
             // get attr value
             const attr_value_start = i;
             switch (quote) {
-                '\'' => i = skip(self.raw_wikitext, attribute_value_single_quote_pred, i) orelse return ParseError.InvalidHtmlTag,
-                '"' => i = skip(self.raw_wikitext, attribute_value_double_quote_pred, i) orelse return ParseError.InvalidHtmlTag,
+                '\'' => i = try skip(self.raw_wikitext, attribute_value_single_quote_pred, i, FAIL),
+                '"' => i = try skip(self.raw_wikitext, attribute_value_double_quote_pred, i, FAIL),
                 else => unreachable,
             }
             const attr_value = self.raw_wikitext[attr_value_start..i];
 
             // skip last quote
-            i = try advance(i, 1, self.raw_wikitext);
+            i = try advance(i, 1, self.raw_wikitext, FAIL);
 
             try attrs.append(.{ .name = attr_name, .value = attr_value });
 
             // skip whitespace after attr name
-            i = skip(self.raw_wikitext, whitespace_pred, i) orelse return ParseError.InvalidHtmlTag;
+            i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
         }
+
         if (i + 1 >= self.raw_wikitext.len)
-            return ParseError.InvalidHtmlTag;
+            return FAIL;
 
         // Handle self closing tag
         if (self.raw_wikitext[i] == '/') {
-            if (self.raw_wikitext[i + 1] != '>') {
-                return ParseError.InvalidHtmlTag;
-            }
+            if (self.raw_wikitext[i + 1] != '>')
+                return FAIL;
             if (attrs.items.len > 0) {
                 try self.nodes.append(.{ .html_tag = .{
                     .tag_name = tag_name,
@@ -260,13 +262,13 @@ pub const MWParser = struct {
                     .attrs = null,
                 } });
             }
-            return try advance(i, "/>".len, self.raw_wikitext);
+            return try advance(i, "/>".len, self.raw_wikitext, FAIL);
         }
 
         // skip closing '>'
         if (self.raw_wikitext[i] != '>')
-            return ParseError.InvalidHtmlTag;
-        i = try advance(i, 1, self.raw_wikitext);
+            return FAIL;
+        i = try advance(i, 1, self.raw_wikitext, FAIL);
 
         const content_start = i;
 
@@ -278,24 +280,24 @@ pub const MWParser = struct {
                     const content_end = i;
 
                     // skip '>'
-                    i = try advance(i, 1, self.raw_wikitext);
+                    i = try advance(i, 1, self.raw_wikitext, FAIL);
                     if (self.raw_wikitext[i] != '/')
-                        return ParseError.InvalidHtmlTag;
+                        return FAIL;
                     // skip '/'
-                    i = try advance(i, 1, self.raw_wikitext);
+                    i = try advance(i, 1, self.raw_wikitext, FAIL);
 
                     // get close tag name
                     const close_tag_name_start = i;
-                    i = skip(self.raw_wikitext, node_name_pred, i) orelse return ParseError.InvalidHtmlTag;
+                    i = try skip(self.raw_wikitext, node_name_pred, i, FAIL);
                     const close_tag_name = self.raw_wikitext[close_tag_name_start..i];
 
                     // validate
                     if (!std.mem.eql(u8, close_tag_name, tag_name))
-                        return ParseError.InvalidHtmlTag;
+                        return FAIL;
 
-                    i = skip(self.raw_wikitext, whitespace_pred, i) orelse return ParseError.InvalidHtmlTag;
+                    i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
                     if (self.raw_wikitext[i] != '>')
-                        return ParseError.InvalidHtmlTag;
+                        return FAIL;
 
                     if (attrs.items.len == 0) {
                         try self.nodes.append(.{ .html_tag = .{
@@ -319,29 +321,36 @@ pub const MWParser = struct {
             }
         }
 
-        return ParseError.InvalidHtmlTag;
+        return FAIL;
     }
 
     /// moves to i to after the comment,
     /// or returns `ParseError.UnclosedHtmlComment` if none is found
     fn skipHtmlComment(self: *Self, start: usize) !usize {
+        const FAIL = ParseError.UnclosedHtmlComment;
+
         var i = start;
         while (i < self.raw_wikitext.len) : (i += 1) {
             const ch = self.raw_wikitext[i];
             if (ch == '-') {
                 if (nextEql(self.raw_wikitext, "-->", i)) {
                     return i + "-->".len;
+                } else if (nextEql(self.raw_wikitext, "--", i)) {
+                    return FAIL;
                 }
             }
         }
-        return ParseError.UnclosedHtmlComment;
+
+        return FAIL;
     }
 
     /// attempts to find html entity from '&' start character
     ///
-    /// Returns `null` if not found
+    /// Returns `ParseError.IncompleteHtmlEntity` if not found
     fn parseHtmlEntity(self: *Self, start: usize) !usize {
-        var i: usize = start + 1;
+        const FAIL = ParseError.IncompleteHtmlEntity;
+
+        var i: usize = try advance(start, "&".len, self.raw_wikitext, FAIL);
 
         if (self.raw_wikitext[i] == '#') {
             i += 1;
@@ -354,14 +363,14 @@ pub const MWParser = struct {
                         try self.nodes.append(.{ .html_entity = self.raw_wikitext[start .. i + 1] });
                         return i + 1;
                     } else {
-                        return ParseError.IncompleteHtmlEntity;
+                        return FAIL;
                     }
                 }
 
-                if (ch < 48 or ch > 57) {
-                    return ParseError.IncompleteHtmlEntity;
-                } else {
+                if (isDigit(ch)) {
                     n_digits += 1;
+                } else {
+                    return FAIL;
                 }
             }
         } else {
@@ -374,61 +383,48 @@ pub const MWParser = struct {
             }
         }
 
-        return ParseError.IncompleteHtmlEntity;
+        return FAIL;
     }
 
+    /// called on `start` pointing to '=' at the start of the line
+    /// or start of an article.
     fn parseHeading(self: *Self, start: usize) !usize {
+        const FAIL = ParseError.IncompleteHeading;
+
         var i: usize = start;
+
+        // parse leading =, remembering how many
         var level: usize = 0;
         while (i < self.raw_wikitext.len) : (i += 1) {
             const ch = self.raw_wikitext[i];
             switch (ch) {
                 '=' => level += 1,
-                '\n' => return ParseError.IncompleteHeading,
+                '\n', '\r' => return FAIL,
                 else => break,
             }
         }
-        if (i == self.raw_wikitext.len) {
-            return ParseError.IncompleteHeading;
-        }
 
-        const text_start = i; // we assume one space
-        var text_size: usize = 0;
-        while (i < self.raw_wikitext.len) : (i += 1) {
-            const ch = self.raw_wikitext[i];
-            switch (ch) {
-                '=' => break,
-                '\n' => return ParseError.IncompleteHeading,
-                else => text_size += 1,
-            }
-        }
-        if (i == self.raw_wikitext.len) {
-            return ParseError.IncompleteHeading;
-        }
+        const text_start = i;
 
-        var _level = level;
+        // find next '='
+        i = try skip(self.raw_wikitext, heading_name_pred, i, FAIL);
+        if (self.raw_wikitext[i] == '\n' or self.raw_wikitext[i] == '\r')
+            return FAIL;
 
-        while (i < self.raw_wikitext.len) : (i += 1) {
-            if (_level == 0) { // avoid overflow
-                break;
-            }
+        // verify heading is closed by `level` `=` chars
+        if (!nextEqlCount(self.raw_wikitext, '=', level, i))
+            return FAIL;
 
-            const ch = self.raw_wikitext[i];
-            switch (ch) {
-                '=' => _level -= 1,
-                else => break,
-            }
-        }
-        if (i == self.raw_wikitext.len or _level != 0) {
-            return ParseError.IncompleteHeading;
-        }
-        if (self.raw_wikitext[i] != '\n') {
-            return ParseError.IncompleteHeading;
-        }
+        const text = self.raw_wikitext[text_start..i];
 
-        try self.nodes.append(.{ .heading = .{ .heading = self.raw_wikitext[text_start .. text_start + text_size], .level = level } });
+        // skip '=', test if followed by '\n'
+        i = try advance(i, level, self.raw_wikitext, FAIL);
+        if (self.raw_wikitext[i] != '\n')
+            return FAIL;
 
-        return i + 1; // push past newline
+        try self.nodes.append(.{ .heading = .{ .heading = text, .level = level } });
+
+        return i;
     }
 
     /// Returns size of the node
@@ -437,6 +433,8 @@ pub const MWParser = struct {
     ///
     /// Returns `ParseError.IncompleteArgument` if unclosed
     fn parseArgument(self: *Self, start: usize) !usize {
+        const FAIL = ParseError.IncompleteArgument;
+
         var i: usize = start + "{{{".len;
         while (i < self.raw_wikitext.len) {
             const ch = self.raw_wikitext[i];
@@ -447,29 +445,31 @@ pub const MWParser = struct {
                     const text = self.raw_wikitext[start..end];
                     try self.nodes.append(.{ .argument = text });
                     return end;
+                } else {
+                    return FAIL;
                 }
             }
 
             i += 1;
         }
 
-        return ParseError.IncompleteArgument;
+        return FAIL;
     }
 };
 
 /// Advances `i` until `continue_pred` returns false
 ///
-/// If end of `buf` is reached, returns `null`
+/// If end of `buf` is reached, returns error `E`
 ///
 /// Predicate calls are inlined for performance
-fn skip(buf: []const u8, continue_pred: fn (u8) bool, _i: usize) ?usize {
+fn skip(buf: []const u8, continue_pred: fn (u8) bool, _i: usize, E: anyerror) !usize {
     var i = _i;
     while (i < buf.len) : (i += 1) {
         if (!@call(.always_inline, continue_pred, .{buf[i]})) {
             return i;
         }
     }
-    return null;
+    return E;
 }
 
 /// Stops on ' ', '\n', '\r', '\t', '/', '>', '?', '\0'
@@ -488,10 +488,18 @@ fn whitespace_pred(ch: u8) bool {
     }
 }
 
-/// Stops on ' ', '\n', '\r', '\t', '/', '>', '?', '\0', '='
+/// Continues on ' ' or '\t'
+fn single_line_whitespace_pred(ch: u8) bool {
+    switch (ch) {
+        ' ', '\t' => return true,
+        else => return false,
+    }
+}
+
+/// Stops on ' ', '\n', '\r', '\t', '/', '>', '='
 fn attribute_name_pred(ch: u8) bool {
     switch (ch) {
-        ' ', '\n', '\r', '\t', '/', '>', '?', 0, '=' => return false,
+        ' ', '\n', '\r', '\t', '/', '>', '=' => return false,
         else => return true,
     }
 }
@@ -506,15 +514,22 @@ fn attribute_value_double_quote_pred(ch: u8) bool {
     return ch != '"';
 }
 
-const AdvanceError = error{AdvanceBeyondBuffer};
+/// Stops on '\n', '\r', '='
+fn heading_name_pred(ch: u8) bool {
+    switch (ch) {
+        '\n', '\r', '=' => return false,
+        else => return true,
+    }
+}
+
 /// Safely advance buffer index `i` by count
 ///
 /// Returns `error.AdvanceBeyondBuffer` if i+count goes out of bounds
-inline fn advance(i: usize, count: usize, buf: []const u8) !usize {
+inline fn advance(i: usize, count: usize, buf: []const u8, E: anyerror) !usize {
     if (i + count < buf.len) {
         return i + count;
     } else {
-        return AdvanceError.AdvanceBeyondBuffer;
+        return E;
     }
 }
 
@@ -522,27 +537,38 @@ inline fn isWhiteSpace(ch: u8) bool {
     return ch == ' ' or ch == '\n' or ch == '\t' or ch == '\r';
 }
 
-/// advance to the first non whitespace
-///
-/// **`\n` and `\r` are considered whitespace**
-inline fn skipWhitespace(buf: []const u8, i: usize) ?usize {
-    while (i < buf.len) : (i += 1) {
-        switch (buf[i]) {
-            ' ', '\t', '\n', '\r' => continue,
-            else => return i,
-        }
-    }
-
-    return null;
+/// true if `ch` is a printable ascii digit dec 48 <--> 57
+inline fn isDigit(ch: u8) bool {
+    return 48 <= ch and ch <= 57;
 }
 
 /// returns `true` if the needle is present starting at i.
 ///
 /// `false` if out of bounds
 inline fn nextEql(buf: []const u8, needle: []const u8, i: usize) bool {
-    if (i + needle.len <= buf.len) {
+    if (i + needle.len <= buf.len)
         return std.mem.eql(u8, buf[i..][0..needle.len], needle);
+    return false;
+}
+
+/// returns `true` if `count` occurences of `ch` are found in succession start at `i`
+inline fn nextEqlCount(buf: []const u8, ch: u8, count: usize, _i: usize) bool {
+    var i = _i;
+
+    if (i + count > buf.len)
+        return false;
+
+    var found: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        if (buf[i] == ch) {
+            found += 1;
+            if (found == count)
+                return true;
+        } else {
+            return false;
+        }
     }
+
     return false;
 }
 
@@ -554,6 +580,17 @@ test "Trivial nextEql" {
     try std.testing.expect(nextEql(wikitext, "{{{", 0));
     try std.testing.expect(nextEql(wikitext, "}}\n", 6));
     try std.testing.expect(!nextEql(wikitext, "{{{", 7));
+}
+
+test "Trivial nextEqlCount" {
+    const wikitext =
+        \\{{{arg}}
+        \\
+    ;
+    try std.testing.expect(nextEqlCount(wikitext, '{', 3, 0));
+    try std.testing.expect(nextEqlCount(wikitext, '}', 2, 6));
+    try std.testing.expect(!nextEqlCount(wikitext, '{', 3, 7));
+    try std.testing.expect(!nextEqlCount("== Anarchism=\n", '=', 2, 12));
 }
 
 test "Errors on unclosed Argument" {
@@ -626,11 +663,11 @@ test "Rejects Various Malformed Headings" {
         \\==
         \\
     ;
-    const wierd: []const u8 =
+    const weird: []const u8 =
         \\= = =
         \\
     ;
-    const cases = [_][]const u8{ unclosed1, unclosed2, overclosed, bad_line_break, wierd };
+    const cases = [_][]const u8{ unclosed1, unclosed2, overclosed, bad_line_break, weird };
 
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -672,7 +709,7 @@ test "Parses Well Formed Heading With Some Text" {
     }
 
     switch (wp.nodes.items[1]) {
-        .text => |text| try std.testing.expectEqualStrings("Blah Blah Blah\nSome more Blah\n", text),
+        .text => |text| try std.testing.expectEqualStrings("\nBlah Blah Blah\nSome more Blah\n", text),
         else => unreachable,
     }
 }
@@ -773,7 +810,7 @@ test "Parses Well Formed Heading With Some Text and a Comment" {
     }
 
     switch (wp.nodes.items[1]) {
-        .text => |text| try std.testing.expectEqualStrings("Blah ", text),
+        .text => |text| try std.testing.expectEqualStrings("\nBlah ", text),
         else => unreachable,
     }
 
