@@ -13,7 +13,7 @@ pub const MWNodeType = enum {
 };
 
 pub const MWNode = union(MWNodeType) {
-    template: []const u8,
+    template: TemplateCtx,
     wiki_link: []const u8,
     external_link: ExternalLinkCtx,
     heading: HeadingCtx,
@@ -46,6 +46,17 @@ pub const HtmlTagCtx = struct {
     children: ?[]HtmlTagCtx,
 };
 
+pub const TemplateCtx = struct {
+    pub const TemplateArg = struct {
+        key: ?[]const u8,
+        value: []const u8,
+    };
+
+    name: []const u8,
+    args: std.DoublyLinkedList(TemplateArg) = std.DoublyLinkedList(TemplateArg){},
+    children: std.DoublyLinkedList(TemplateCtx) = std.DoublyLinkedList(TemplateCtx){},
+};
+
 pub const MWParser = struct {
     /// Contains list of nodes which will eventually contain parsed information
     nodes: std.ArrayList(MWNode),
@@ -69,6 +80,9 @@ pub const MWParser = struct {
         IncompleteHtmlEntity,
         UnclosedHtmlComment,
         InvalidHtmlTag,
+        BadExternalLink,
+        IncompleteTable,
+        BadTemplate,
     };
 
     /// iterates through characters and dispatches to node specific parsing functions
@@ -76,6 +90,8 @@ pub const MWParser = struct {
     /// HTML entities `&lt;` and `&gt;` must be replaced with `<` and `>` to be interpreted as html tags.
     ///
     /// anything starting with `&` is assumed to be an HTML entity. Use `&amp;` instead.
+    ///
+    /// All carriage returns, '\r', will be interpreted as text. Remove them before using.
     pub fn parse(self: *Self) !void {
         var i: usize = 0;
         var cur_text_node = self.raw_wikitext;
@@ -86,21 +102,31 @@ pub const MWParser = struct {
                 // could be a tag or an argument or just text
                 '{' => {
                     if (nextEql(self.raw_wikitext, "{{{", i)) {
-                        if (cur_text_node.len > 0) {
+                        if (cur_text_node.len > 0)
                             try self.nodes.append(.{ .text = cur_text_node });
-                        }
 
                         i = try self.parseArgument(i);
 
                         cur_text_node = self.raw_wikitext[i..];
                         cur_text_node.len = 0;
-                        // we don't increment i becuase parseArgument already did
                     } else if (nextEql(self.raw_wikitext, "{{", i)) {
-                        // dispatch to template parser
-                        i += 1;
+                        if (cur_text_node.len > 0)
+                            try self.nodes.append(.{ .text = cur_text_node });
+
+                        const res = try self.parseTemplate(i);
+                        try self.nodes.append(.{ .template = res.t_ctx });
+                        i += res.offset;
+
+                        cur_text_node = self.raw_wikitext[i..];
+                        cur_text_node.len = 0;
                     } else if (nextEql(self.raw_wikitext, "{|", i)) {
-                        // table
-                        i += 1;
+                        if (cur_text_node.len > 0)
+                            try self.nodes.append(.{ .text = cur_text_node });
+
+                        i = try self.parseTable(i);
+
+                        cur_text_node = self.raw_wikitext[i..];
+                        cur_text_node.len = 0;
                     } else {
                         cur_text_node.len += 1;
                         i += 1;
@@ -110,16 +136,22 @@ pub const MWParser = struct {
                 // wikilink or external link
                 '[' => {
                     if (nextEql(self.raw_wikitext, "[[", i)) {
-                        // wikilink
+                        cur_text_node.len += 1;
+                        i += 1;
                     } else {
-                        // external link
+                        if (cur_text_node.len > 0)
+                            try self.nodes.append(.{ .text = cur_text_node });
+
+                        i = try self.parseExternalLink(i);
+
+                        cur_text_node = self.raw_wikitext[i..];
+                        cur_text_node.len = 0;
                     }
                 },
 
                 '<' => {
-                    if (cur_text_node.len > 0) {
+                    if (cur_text_node.len > 0)
                         try self.nodes.append(.{ .text = cur_text_node });
-                    }
 
                     if (nextEql(self.raw_wikitext, "!--", i + 1)) {
                         i = try self.skipHtmlComment(i + "<!--".len);
@@ -133,9 +165,8 @@ pub const MWParser = struct {
 
                 // html entity
                 '&' => {
-                    if (cur_text_node.len > 0) {
+                    if (cur_text_node.len > 0)
                         try self.nodes.append(.{ .text = cur_text_node });
-                    }
 
                     i = try self.parseHtmlEntity(i);
 
@@ -147,10 +178,11 @@ pub const MWParser = struct {
                 '=' => {
                     // article or line start with an equals is expected to be a heading
                     if (i == 0 or (i > 0 and self.raw_wikitext[i - 1] == '\n')) {
-                        if (cur_text_node.len > 0) {
+                        if (cur_text_node.len > 0)
                             try self.nodes.append(.{ .text = cur_text_node });
-                        }
+
                         i = try self.parseHeading(i);
+
                         cur_text_node = self.raw_wikitext[i..];
                         cur_text_node.len = 0;
                     } else {
@@ -167,9 +199,170 @@ pub const MWParser = struct {
             }
         }
 
-        if (cur_text_node.len > 0) {
+        if (cur_text_node.len > 0)
             try self.nodes.append(.{ .text = cur_text_node });
+    }
+
+    fn parseTemplate(self: *Self, start: usize) !struct { offset: usize, t_ctx: TemplateCtx } {
+        const FAIL = ParseError.BadTemplate;
+
+        const template_name_pred = struct {
+            /// stop on '\n', '}', '|'
+            pub fn tnp(ch: u8) bool {
+                switch (ch) {
+                    '\n', '}', '|' => return false,
+                    else => return true,
+                }
+            }
+        }.tnp;
+
+        var i = start + "{{".len;
+
+        // get template name
+        const template_name_start = i;
+        i = try skip(self.raw_wikitext, template_name_pred, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
+        const template_name = self.raw_wikitext[template_name_start..i];
+
+        // skip whitespace after template name
+        i = try skip(self.raw_wikitext, single_line_whitespace_pred, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
+
+        // if template closes, return it
+        if (nextEql(self.raw_wikitext, "}}", i)) {
+            return .{
+                .offset = i + "}}".len,
+                .t_ctx = .{ .name = template_name },
+            };
         }
+
+        const arg_first_pred = struct {
+            /// stop on '\n', '=', '{', '}'
+            pub fn afp(ch: u8) bool {
+                switch (ch) {
+                    '\n', '=', '{', '}' => return false,
+                    else => return true,
+                }
+            }
+        }.afp;
+
+        // if args exist to parse, parse them
+        if (self.raw_wikitext[i] == '|') {
+            i += "|".len;
+
+            const TL = std.DoublyLinkedList(TemplateCtx.TemplateArg);
+            var args = TL{};
+            const CL = std.DoublyLinkedList(TemplateCtx);
+            var children = CL{};
+            while (i < self.raw_wikitext.len) {
+                const arg_start = i;
+
+                i = try skip(self.raw_wikitext, arg_first_pred, i, FAIL);
+
+                switch (self.raw_wikitext[i]) {
+                    '=' => return FAIL,
+                    '{' => {
+                        if (nextEql(self.raw_wikitext, "{{", i)) {
+                            const res = try self.parseTemplate(i);
+                            const child = try self.a.create(CL.Node);
+                            child.* = .{ .data = res.t_ctx };
+                            children.append(child);
+                            i = res.offset;
+                        } else {
+                            return FAIL;
+                        }
+                    },
+                    '}' => {
+                        if (nextEql(self.raw_wikitext, "}}", i)) {
+                            if (arg_start == i) {
+                                return .{
+                                    .offset = i + "}}".len,
+                                    .t_ctx = .{ .name = template_name, .args = args, .children = children },
+                                };
+                            }
+
+                            const arg = try self.a.create(TL.Node);
+                            arg.*.data = .{
+                                .key = null,
+                                .value = self.raw_wikitext[arg_start..i],
+                            };
+                            args.append(arg);
+
+                            return .{
+                                .offset = i + "}}".len,
+                                .t_ctx = .{ .name = template_name, .args = args, .children = children },
+                            };
+                        } else {
+                            return FAIL;
+                        }
+                    },
+                    '\n' => return FAIL,
+                    else => return FAIL,
+                }
+            }
+        }
+        return FAIL;
+    }
+
+    /// Returns i pointing to after pointer, errors otherwise
+    fn parseTable(self: *Self, start: usize) !usize {
+        const FAIL = ParseError.IncompleteTable;
+
+        var i = start + "{|".len;
+
+        while (i < self.raw_wikitext.len) {
+            i = try skip(self.raw_wikitext, table_pred, i, FAIL);
+            if (nextEql(self.raw_wikitext, "|}", i)) {
+                return i + "|}".len;
+            }
+            i += 1;
+        }
+
+        return FAIL;
+    }
+
+    fn parseExternalLink(self: *Self, start: usize) !usize {
+        const FAIL = ParseError.BadExternalLink;
+
+        // skip opening [
+        var i = try advance(start, "[".len, self.raw_wikitext, FAIL);
+
+        // extract url
+        const url_start = i;
+        i = try skip(self.raw_wikitext, external_link_text_pred, i, FAIL);
+        if (self.raw_wikitext[i] == '\n' or self.raw_wikitext[i] == '\r')
+            return FAIL;
+        const url = self.raw_wikitext[url_start..i];
+
+        // skip whitespace after url
+        i = try skip(self.raw_wikitext, single_line_whitespace_pred, i, FAIL);
+        if (self.raw_wikitext[i] == '\n' or self.raw_wikitext[i] == '\r')
+            return FAIL;
+
+        // if no name found, return
+        if (self.raw_wikitext[i] == ']') {
+            try self.nodes.append(.{ .external_link = .{
+                .url = url,
+                .title = null,
+            } });
+            return i + 1;
+        }
+
+        const name_start = i;
+        i = try skip(self.raw_wikitext, external_link_text_pred, i, FAIL);
+        if (self.raw_wikitext[i] == '\n' or self.raw_wikitext[i] == '\r')
+            return FAIL;
+        const name = self.raw_wikitext[name_start..i];
+
+        i = try skip(self.raw_wikitext, single_line_whitespace_pred, i, FAIL);
+        if (self.raw_wikitext[i] != ']')
+            return FAIL;
+
+        try self.nodes.append(.{ .external_link = .{
+            .url = url,
+            .title = name,
+        } });
+        return i + 1;
     }
 
     /// **Internal WIP**
@@ -522,6 +715,22 @@ fn heading_name_pred(ch: u8) bool {
     }
 }
 
+/// Stops on ' ', '\n', '\r', '\t', ']'
+fn external_link_text_pred(ch: u8) bool {
+    switch (ch) {
+        ' ', '\t', '\n', '\r', ']' => return false,
+        else => return true,
+    }
+}
+
+/// Stops on '|'
+fn table_pred(ch: u8) bool {
+    switch (ch) {
+        '|' => return false,
+        else => return true,
+    }
+}
+
 /// Safely advance buffer index `i` by count
 ///
 /// Returns `error.AdvanceBeyondBuffer` if i+count goes out of bounds
@@ -540,6 +749,12 @@ inline fn isWhiteSpace(ch: u8) bool {
 /// true if `ch` is a printable ascii digit dec 48 <--> 57
 inline fn isDigit(ch: u8) bool {
     return 48 <= ch and ch <= 57;
+}
+
+/// returns `E` if `ch` is `\n`
+inline fn errOnLineBreak(ch: u8, E: anyerror) !void {
+    if (ch == '\n')
+        return E;
 }
 
 /// returns `true` if the needle is present starting at i.
@@ -899,6 +1114,156 @@ test "Decodes HTML Tag Attributes Correctly" {
             try std.testing.expectEqualStrings("web", t.attrs.?[0].value);
             try std.testing.expectEqualStrings("ref", t.tag_name);
             try std.testing.expectEqualStrings("citation", t.text.?);
+        },
+        else => unreachable,
+    }
+}
+
+test "External Link No Title" {
+    const wikitext = "[https://example.com]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+    switch (wp.nodes.items[0]) {
+        .external_link => |el| {
+            try std.testing.expect(el.title == null);
+            try std.testing.expectEqualStrings("https://example.com", el.url);
+        },
+        else => unreachable,
+    }
+}
+
+test "External Link With Title" {
+    const wikitext = "[https://example.com Example]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+    switch (wp.nodes.items[0]) {
+        .external_link => |el| {
+            try std.testing.expectEqualStrings("https://example.com", el.url);
+            try std.testing.expectEqualStrings("Example", el.title.?);
+        },
+        else => unreachable,
+    }
+}
+
+test "Skips Table" {
+    const wikitext =
+        \\Very Nice Table!
+        \\{|class="wikitable" style="border: none; background: none; float: right;"
+        \\|+ Anarchist vs. statist perspectives on education<br/>{{Small|Ruth Kinna (2019){{Sfn|Kinna|2019|p=97}}}}
+        \\|-
+        \\!scope="col"|
+        \\!scope="col"|Anarchist education
+        \\!scope="col"|State education
+        \\|-
+        \\|Concept || Education as self-mastery || Education as service
+        \\|-
+        \\|Management || Community based || State run
+        \\|-
+        \\|Methods || Practice-based learning || Vocational training
+        \\|-
+        \\|Aims || Being a critical member of society || Being a productive member of society
+        \\|}
+        \\Glad the table is over!
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 2);
+
+    switch (wp.nodes.items[0]) {
+        .text => |t| try std.testing.expectEqualStrings("Very Nice Table!\n", t),
+        else => unreachable,
+    }
+
+    switch (wp.nodes.items[1]) {
+        .text => |t| try std.testing.expectEqualStrings("\nGlad the table is over!", t),
+        else => unreachable,
+    }
+}
+
+test "Parses Template No Args" {
+    const wikitext = "{{Anarchism sidebar}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+
+    switch (wp.nodes.items[0]) {
+        .template => |temp| {
+            try std.testing.expectEqualStrings("Anarchism sidebar", temp.name);
+            try std.testing.expect(temp.children.len == 0);
+            try std.testing.expect(temp.args.len == 0);
+        },
+        else => unreachable,
+    }
+}
+
+test "Parses Template Non Keyed Argument" {
+    const wikitext = "{{Main|Definition of anarchism and libertarianism}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+
+    switch (wp.nodes.items[0]) {
+        .template => |temp| {
+            try std.testing.expectEqualStrings("Main", temp.name);
+            try std.testing.expect(temp.children.len == 0);
+            try std.testing.expect(temp.args.len == 1);
+            try std.testing.expect(temp.args.first.?.data.key == null);
+            try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", temp.args.first.?.data.value);
+        },
+        else => unreachable,
+    }
+}
+
+test "Parses Template With Child as Arg" {
+    const wikitext = "{{Main|{{Definition of anarchism and libertarianism}}}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+
+    switch (wp.nodes.items[0]) {
+        .template => |temp| {
+            try std.testing.expectEqualStrings("Main", temp.name);
+            try std.testing.expect(temp.args.len == 0);
+            try std.testing.expect(temp.children.len == 1);
+            try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", temp.children.first.?.data.name);
         },
         else => unreachable,
     }
