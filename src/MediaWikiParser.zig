@@ -77,7 +77,7 @@ pub const MWParser = struct {
         };
     }
 
-    const ParseError = error{
+    pub const ParseError = error{
         IncompleteArgument,
         IncompleteHeading,
         IncompleteHtmlEntity,
@@ -126,7 +126,7 @@ pub const MWParser = struct {
                         };
 
                         try self.nodes.append(.{ .template = res.t_ctx });
-                        i += res.offset;
+                        i = res.offset;
 
                         cur_text_node = self.raw_wikitext[i..];
                         cur_text_node.len = 0;
@@ -172,7 +172,14 @@ pub const MWParser = struct {
                     if (nextEql(self.raw_wikitext, "!--", i + 1)) {
                         i = try self.skipHtmlComment(i + "<!--".len);
                     } else {
-                        i = try self.parseHtmlTag(i);
+                        i = self.parseHtmlTag(i) catch |err| switch (err) {
+                            error.InvalidHtmlTag => {
+                                // TODO: Better error reporting
+                                //std.debug.print("InvalidHtmlTag\n{s}\n", .{self.raw_wikitext[i - 30 .. i + 30]});
+                                return err;
+                            },
+                            else => return err,
+                        };
                     }
 
                     cur_text_node = self.raw_wikitext[i..];
@@ -451,15 +458,13 @@ pub const MWParser = struct {
 
         // extract url
         const url_start = i;
-        i = try skip(self.raw_wikitext, external_link_text_pred, i, FAIL);
-        if (self.raw_wikitext[i] == '\n' or self.raw_wikitext[i] == '\r')
-            return FAIL;
+        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', ' ', '\t', ']' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
         const url = self.raw_wikitext[url_start..i];
 
         // skip whitespace after url
-        i = try skip(self.raw_wikitext, single_line_whitespace_pred, i, FAIL);
-        if (self.raw_wikitext[i] == '\n' or self.raw_wikitext[i] == '\r')
-            return FAIL;
+        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
 
         // if no name found, return
         if (self.raw_wikitext[i] == ']') {
@@ -470,13 +475,12 @@ pub const MWParser = struct {
             return i + 1;
         }
 
+        // get display name
         const name_start = i;
-        i = try skip(self.raw_wikitext, external_link_text_pred, i, FAIL);
-        if (self.raw_wikitext[i] == '\n' or self.raw_wikitext[i] == '\r')
-            return FAIL;
+        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', ']' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
         const name = self.raw_wikitext[name_start..i];
 
-        i = try skip(self.raw_wikitext, single_line_whitespace_pred, i, FAIL);
         if (self.raw_wikitext[i] != ']')
             return FAIL;
 
@@ -594,12 +598,9 @@ pub const MWParser = struct {
                     // end content
                     const content_end = i;
 
-                    // skip '>'
-                    i = try advance(i, 1, self.raw_wikitext, FAIL);
-                    if (self.raw_wikitext[i] != '/')
+                    if (!nextEql(self.raw_wikitext, "</", i))
                         return FAIL;
-                    // skip '/'
-                    i = try advance(i, 1, self.raw_wikitext, FAIL);
+                    i += "</".len;
 
                     // get close tag name
                     const close_tag_name_start = i;
@@ -777,11 +778,11 @@ inline fn skipWhileOneOf(buf: []const u8, comptime continues: []const u8, i: usi
     var _i = i;
 
     while (_i < buf.len) : (_i += 1) {
-        inline for (continues) |c| {
-            if (buf[_i] != c) {
-                return _i;
-            }
-        }
+        var cont: bool = false;
+        inline for (continues) |c|
+            cont = cont or buf[_i] == c;
+        if (!cont)
+            return _i;
     }
 
     return E;
@@ -1080,6 +1081,21 @@ test "Parses Well Formed Heading With Some Text" {
     }
 }
 
+test "Parses Heading with embedded html with attributes" {
+    //const wikitext =
+    //    \\=== Computing <span class="anchor" id="Computing codes"></span> ==="
+    //;
+
+    //var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    //defer arena.deinit();
+    //const a = arena.allocator();
+
+    //var wp = MWParser.init(a, wikitext);
+    //try wp.parse();
+
+    return error.SkipZigTest;
+}
+
 test "Rejects various malformed html entities" {
     const non_numerical_num: []const u8 = "&#hello;";
     const too_many_digits: []const u8 = "&#12345;";
@@ -1270,6 +1286,22 @@ test "Decodes HTML Tag Attributes Correctly" {
     }
 }
 
+// Unsure if this will ever pass due to <> present within the tag
+test "Real Ref Tag 1" {
+    //const wikitext =
+    //    \\<ref name="Winston">{{cite journal| first=Jay |last=Winston |title=The Annual Course of Zonal Mean Albedo as Derived From ESSA 3 and 5 Digitized Picture Data |journal=Monthly Weather Review |volume=99 |pages=818–827| bibcode=1971MWRv...99..818W| date=1971| doi=10.1175/1520-0493(1971)099<0818:TACOZM>2.3.CO;2| issue=11|doi-access=free}}</ref>"
+    //;
+
+    //var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    //defer arena.deinit();
+    //const a = arena.allocator();
+
+    //var wp = MWParser.init(a, wikitext);
+    //wp.parse() catch {};
+
+    return error.SkipZigTest;
+}
+
 test "External Link No Title" {
     const wikitext = "[https://example.com]";
 
@@ -1291,7 +1323,7 @@ test "External Link No Title" {
 }
 
 test "External Link With Title" {
-    const wikitext = "[https://example.com Example]";
+    const wikitext = "[http://dwardmac.pitzer.edu Anarchy Archives]";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1303,8 +1335,8 @@ test "External Link With Title" {
     try std.testing.expect(wp.nodes.items.len == 1);
     switch (wp.nodes.items[0]) {
         .external_link => |el| {
-            try std.testing.expectEqualStrings("https://example.com", el.url);
-            try std.testing.expectEqualStrings("Example", el.title.?);
+            try std.testing.expectEqualStrings("http://dwardmac.pitzer.edu", el.url);
+            try std.testing.expectEqualStrings("Anarchy Archives", el.title.?);
         },
         else => unreachable,
     }

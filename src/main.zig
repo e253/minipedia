@@ -2,6 +2,7 @@ const std = @import("std");
 const wxmlp = @import("wikixmlparser.zig");
 const SliceArray = @import("slice_array.zig").SliceArray;
 const lzma = @import("lzma.zig");
+const MWParser = @import("MediaWikiParser.zig").MWParser;
 
 pub fn main() !void {
     const args = try Args.parse();
@@ -35,7 +36,6 @@ pub fn main() !void {
     const n_articles_to_process = args.n_articles_to_process;
     var n_articles_processed: usize = 0;
     var n_redirects_skipped: usize = 0;
-    var n_low_value_articles_skipped: usize = 0;
 
     // Header
     var block_offsets = std.ArrayList(u64).init(std.heap.c_allocator);
@@ -70,64 +70,34 @@ pub fn main() !void {
             continue;
         };
 
-        const title = wikiArticle.title;
-        if (std.mem.indexOfPosLinear(u8, title, 0, "isambiguation") != null) {
-            n_low_value_articles_skipped += 1;
-            continue;
-        }
+        total_article_bytes_read += wikiArticle.article.len;
 
-        const article = wikiArticle.article;
-        total_article_bytes_read += article.len;
-
-        const ref_section_start = blk: {
-            const ref_start_opt = std.mem.indexOf(u8, article, "== References ==");
-            if (ref_start_opt) |ref_start| {
-                break :blk ref_start;
-            }
-            const ref_start_opt2 = std.mem.indexOf(u8, article, "==References==");
-            if (ref_start_opt2) |ref_start| {
-                break :blk ref_start;
-            }
-
-            break :blk article.len;
-        };
-
-        var processedArticle = SliceArray.init(alloc);
-        try processedArticle.append(article[0..ref_section_start]);
-
-        processedArticle.removeSections("{|", "|}") catch |err| switch (err) {
-            error.UnclosedSection => {}, // TODO: log
-            error.OutOfMemory => return err,
-        };
-        processedArticle.removeSections("&lt;!--", "--&gt;") catch |err| switch (err) {
-            error.UnclosedSection => {}, // TODO: log
-            error.OutOfMemory => return err,
-        };
-        processedArticle.removeSections("&lt;!--", "--") catch |err| switch (err) {
-            error.UnclosedSection => {}, // TODO: log
-            error.OutOfMemory => return err,
-        };
-        processedArticle.removeSections("&lt;ref", "&lt;/ref&gt;") catch |err| switch (err) {
-            error.UnclosedSection => {}, // TODO: log
-            error.OutOfMemory => return err,
-        };
-        processedArticle.removeSections("&lt;ref", "/&gt;") catch |err| switch (err) {
-            error.UnclosedSection => {}, // TODO: log
-            error.OutOfMemory => return err,
-        };
-        processedArticle.removeSections("{{", "}}") catch |err| switch (err) {
-            error.UnclosedSection => {}, // TODO: log
-            error.OutOfMemory => return err,
+        const preProcessedArticle = try preprocessArticle(alloc, wikiArticle.article);
+        const processedArticle = blk: {
+            const PE = MWParser.ParseError;
+            break :blk wikicodeToMarkdown(alloc, preProcessedArticle) catch |err| switch (err) {
+                PE.BadExternalLink,
+                PE.BadTemplate,
+                PE.BadWikiLink,
+                PE.IncompleteArgument,
+                PE.IncompleteHeading,
+                PE.IncompleteHtmlEntity,
+                PE.IncompleteTable,
+                PE.InvalidHtmlTag,
+                PE.UnclosedHtmlComment,
+                => {
+                    std.debug.print("Article ID: {} ... {s}\n", .{ n_articles_processed, @errorName(err) });
+                    break :blk preProcessedArticle;
+                },
+                else => return err,
+            };
         };
 
-        try processedArticle.findAndReplace("''''", "***");
-        try processedArticle.findAndReplace("'''", "**");
-        try processedArticle.findAndReplace("''", "*");
-        try processedArticle.findAndReplace("&quot;", "\"");
+        const size_to_write = processedArticle.len + wikiArticle.title.len + @sizeOf(usize) + "# ".len + "\n".len + "0".len;
 
         // block is full! compress contents and flush them out
         // add a block_offset to the array
-        if (lzma_block_size + processedArticle.len + title.len + 12 >= lzma_block_size_limit) {
+        if (lzma_block_size + size_to_write >= lzma_block_size_limit) {
             const compressed_output = try lzma.compress(&alloc, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
             try out.writeAll(compressed_output);
 
@@ -143,21 +113,17 @@ pub fn main() !void {
             block_id += 1;
         }
 
-        // Copy contents to accumulation buffer
-        var article_id_bytes: [8]u8 = undefined;
-        std.mem.writeInt(usize, &article_id_bytes, n_articles_processed, .big);
-        @memcpy(lzma_block_accum_buffer[lzma_block_size .. lzma_block_size + 8], &article_id_bytes);
-        lzma_block_size += 8;
-        @memcpy(lzma_block_accum_buffer[lzma_block_size .. lzma_block_size + "# ".len], "# ");
-        lzma_block_size += 2;
-        @memcpy(lzma_block_accum_buffer[lzma_block_size .. lzma_block_size + title.len], title);
-        lzma_block_size += title.len;
-        lzma_block_accum_buffer[lzma_block_size] = '\n';
-        lzma_block_size += 1;
-        try processedArticle.writeToSlice(lzma_block_accum_buffer[lzma_block_size..]);
-        lzma_block_size += processedArticle.len;
-        lzma_block_accum_buffer[lzma_block_size] = 0;
-        lzma_block_size += 1;
+        var accum_buffer_fbs = std.io.fixedBufferStream(lzma_block_accum_buffer[lzma_block_size..]);
+        const accum_buffer_writer = accum_buffer_fbs.writer();
+
+        try accum_buffer_writer.writeInt(usize, n_articles_processed, .big);
+        try accum_buffer_writer.writeAll("# ");
+        try accum_buffer_writer.writeAll(wikiArticle.title);
+        try accum_buffer_writer.writeByte('\n');
+        try accum_buffer_writer.writeAll(processedArticle);
+        try accum_buffer_writer.writeByte(0);
+
+        lzma_block_size += size_to_write;
 
         // Write down what block this article is in
         try article_id_block_id_map.append(block_id);
@@ -210,12 +176,55 @@ pub fn main() !void {
         @as(f32, @floatFromInt(total_bytes_written)) / @as(f32, @floatFromInt(n_articles_to_process)) / 1_000.0,
     });
     std.debug.print("Processed {} articles, skipped {} articles\n", .{ n_articles_processed, n_redirects_skipped });
-    std.debug.print("Skipped {} low value articles\n", .{n_low_value_articles_skipped});
     const end_time = std.time.milliTimestamp();
     const t_in_s = @divFloor((end_time - start_time), 1000);
     std.debug.print("{} min {} sec\n", .{ @divFloor(t_in_s, 60), @mod(t_in_s, 60) });
     const articles_per_s = @as(f32, @floatFromInt(n_articles_processed)) / (@as(f32, @floatFromInt(end_time - start_time)) / 1000.0);
     std.debug.print("{d} articles/s\n", .{articles_per_s});
+}
+
+/// Performs substitutions before wikitext can be parsed to an AST
+///
+/// Uses `SliceArray` for performance
+///
+/// `''''` to `***`
+///
+/// `'''` to `**`
+///
+/// `''` to `*`
+///
+/// `&quot;` to `"`
+///
+/// `&lt;` to `<`
+///
+/// `&gt;` to `>`
+///
+/// `&amp;nbsp;` to `&nbsp;`
+///
+/// delete `\r`
+fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
+    var sa = SliceArray.init(a);
+    defer sa.deinit();
+    try sa.append(article);
+
+    try sa.findAndReplace("''''", "***");
+    try sa.findAndReplace("'''", "**");
+    try sa.findAndReplace("''", "*");
+    try sa.findAndReplace("&quot;", "\"");
+    try sa.findAndReplace("&lt;", "<");
+    try sa.findAndReplace("&gt;", ">");
+    try sa.findAndReplace("&amp;nbsp;", "&nbsp;");
+    try sa.findAndReplace("\r", "");
+
+    return try sa.toSlice();
+}
+
+/// Uses `MWParser` to separate the wikicode into elements
+///
+fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8) ![]const u8 {
+    var wp = MWParser.init(a, raw_wikitext);
+    try wp.parse();
+    return raw_wikitext;
 }
 
 pub const Args = struct {
