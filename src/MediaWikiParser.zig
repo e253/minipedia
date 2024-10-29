@@ -48,11 +48,15 @@ pub const HtmlTagCtx = struct {
         name: []const u8,
         value: []const u8,
     };
+    pub const AttrList = std.DoublyLinkedList(HtmlTagAttr);
+    pub const AttrNode = AttrList.Node;
+    pub const ChildList = std.DoublyLinkedList(MWNode);
+    pub const ChildNode = ChildList.Node;
 
     tag_name: []const u8,
-    text: ?[]const u8,
-    attrs: ?[]HtmlTagAttr,
-    children: ?[]HtmlTagCtx,
+    attrs: AttrList = AttrList{},
+    /// Nodes in between \<tag\> and \</tag\>, including text
+    children: ChildList = ChildList{},
 };
 
 pub const TemplateCtx = struct {
@@ -173,13 +177,15 @@ pub const MWParser = struct {
                     if (nextEql(self.raw_wikitext, "!--", i + 1)) {
                         i = try self.skipHtmlComment(i + "<!--".len);
                     } else {
-                        i = self.parseHtmlTag(i) catch |err| switch (err) {
+                        const res = self.parseHtmlTag(i) catch |err| switch (err) {
                             error.InvalidHtmlTag => {
                                 std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
                                 return err;
                             },
                             else => return err,
                         };
+                        i = res.offset;
+                        try self.nodes.append(.{ .html_tag = res.ht_ctx });
                     }
 
                     cur_text_node = self.raw_wikitext[i..];
@@ -498,7 +504,7 @@ pub const MWParser = struct {
     /// TODO: handle nesting
     ///
     /// TODO: handle wrapped templates
-    fn parseHtmlTag(self: *Self, start: usize) !usize {
+    fn parseHtmlTag(self: *Self, start: usize) !struct { offset: usize, ht_ctx: HtmlTagCtx } {
         const FAIL = ParseError.InvalidHtmlTag;
 
         var i = try advance(start, "<".len, self.raw_wikitext, FAIL);
@@ -514,7 +520,7 @@ pub const MWParser = struct {
         i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
 
         // attempt to find attributes
-        var attrs = std.ArrayList(HtmlTagCtx.HtmlTagAttr).init(self.a);
+        var attrs = HtmlTagCtx.AttrList{};
         while (attribute_name_pred(self.raw_wikitext[i])) {
             if (i >= self.raw_wikitext.len)
                 return FAIL;
@@ -559,7 +565,9 @@ pub const MWParser = struct {
             if (quote != 0)
                 i += 1;
 
-            try attrs.append(.{ .name = attr_name, .value = attr_value });
+            const attr = try self.a.create(HtmlTagCtx.AttrNode);
+            attr.*.data = .{ .name = attr_name, .value = attr_value };
+            attrs.append(attr);
 
             // skip whitespace after attr name
             i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
@@ -572,82 +580,90 @@ pub const MWParser = struct {
         if (self.raw_wikitext[i] == '/') {
             if (self.raw_wikitext[i + 1] != '>')
                 return FAIL;
-            if (attrs.items.len > 0) {
-                try self.nodes.append(.{ .html_tag = .{
+            return .{
+                .offset = i + "/>".len,
+                .ht_ctx = .{
                     .tag_name = tag_name,
-                    .text = null,
-                    .children = null,
-                    .attrs = try attrs.toOwnedSlice(),
-                } });
-            } else {
-                try self.nodes.append(.{ .html_tag = .{
-                    .tag_name = tag_name,
-                    .text = null,
-                    .children = null,
-                    .attrs = null,
-                } });
-            }
-            return i + "/>".len;
+                    .attrs = attrs,
+                },
+            };
         }
 
         // skip closing '>'
         if (self.raw_wikitext[i] != '>')
             return FAIL;
-        i = try advance(i, 1, self.raw_wikitext, FAIL);
+        i += ">".len;
 
-        const content_start = i;
+        var children = HtmlTagCtx.ChildList{};
 
-        while (i < self.raw_wikitext.len) : (i += 1) {
-            const ch = self.raw_wikitext[i];
-            switch (ch) {
-                '<' => {
-                    // end content
-                    const content_end = i;
+        var cur_text_node = self.raw_wikitext[i..];
+        cur_text_node.len = 0;
+        while (i < self.raw_wikitext.len) {
+            if (nextEql(self.raw_wikitext, "</", i)) { // if tag ends, end it!
+                if (!nextEql(self.raw_wikitext, "</", i))
+                    return FAIL;
+                i += "</".len;
 
-                    if (!nextEql(self.raw_wikitext, "</", i))
-                        return FAIL;
-                    i += "</".len;
+                // get close tag name
+                const close_tag_name_start = i;
+                i = try skip(self.raw_wikitext, node_name_pred, i, FAIL);
+                const close_tag_name = self.raw_wikitext[close_tag_name_start..i];
 
-                    // get close tag name
-                    const close_tag_name_start = i;
-                    i = try skip(self.raw_wikitext, node_name_pred, i, FAIL);
-                    const close_tag_name = self.raw_wikitext[close_tag_name_start..i];
+                // validate
+                if (!std.mem.eql(u8, close_tag_name, tag_name))
+                    return FAIL;
 
-                    // validate
-                    if (!std.mem.eql(u8, close_tag_name, tag_name))
-                        return FAIL;
+                i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
+                if (self.raw_wikitext[i] != '>')
+                    return FAIL;
 
-                    i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
-                    if (self.raw_wikitext[i] != '>')
-                        return FAIL;
+                const text_node = try self.a.create(HtmlTagCtx.ChildNode);
+                text_node.*.data = .{ .text = cur_text_node };
+                children.append(text_node);
 
-                    if (attrs.items.len == 0) {
-                        try self.nodes.append(.{ .html_tag = .{
-                            .tag_name = tag_name,
-                            .text = self.raw_wikitext[content_start..content_end],
-                            .attrs = null,
-                            .children = null,
-                        } });
-                    } else {
-                        try self.nodes.append(.{ .html_tag = .{
-                            .tag_name = tag_name,
-                            .text = self.raw_wikitext[content_start..content_end],
-                            .attrs = try attrs.toOwnedSlice(),
-                            .children = null,
-                        } });
-                    }
+                return .{
+                    .offset = i + 1,
+                    .ht_ctx = .{
+                        .tag_name = tag_name,
+                        .attrs = attrs,
+                        .children = children,
+                    },
+                };
+            } else if (nextEql(self.raw_wikitext, "<!--", i)) { // comment ... skip it!
+                const text_node = try self.a.create(HtmlTagCtx.ChildNode);
+                text_node.*.data = .{ .text = cur_text_node };
+                children.append(text_node);
 
-                    return i + 1;
-                },
-                else => {},
+                i = try self.skipHtmlComment(i + "<!--".len);
+
+                cur_text_node = self.raw_wikitext[i..];
+                cur_text_node.len = 0;
+            } else if (self.raw_wikitext[i] == '<') { // another html tag
+                const text_node = try self.a.create(HtmlTagCtx.ChildNode);
+                text_node.*.data = .{ .text = cur_text_node };
+                children.append(text_node);
+
+                const res = try self.parseHtmlTag(i);
+                const child = try self.a.create(HtmlTagCtx.ChildNode);
+                child.*.data = .{ .html_tag = res.ht_ctx };
+                children.append(child);
+                i = res.offset;
+
+                cur_text_node = self.raw_wikitext[i..];
+                cur_text_node.len = 0;
+            } else {
+                i += 1;
+                cur_text_node.len += 1;
             }
         }
 
         return FAIL;
     }
 
-    /// moves to i to after the comment,
+    /// moves to `i` to after the comment,
     /// or returns `ParseError.UnclosedHtmlComment` if none is found
+    ///
+    /// `i` should point to the first char after `<!--`
     fn skipHtmlComment(self: *Self, start: usize) !usize {
         const FAIL = ParseError.UnclosedHtmlComment;
 
@@ -916,8 +932,6 @@ inline fn errOnLineBreak(ch: u8, E: anyerror) !void {
 }
 
 /// returns `true` if the needle is present starting at i.
-///
-/// `false` if out of bounds
 inline fn nextEql(buf: []const u8, needle: []const u8, i: usize) bool {
     if (i + needle.len <= buf.len)
         return std.mem.eql(u8, buf[i..][0..needle.len], needle);
@@ -1181,6 +1195,8 @@ test "Skips HTML Comment" {
 
     var wp = MWParser.init(a, wikitext);
     try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 0);
 }
 
 test "Parses Well Formed Heading With Some Text and a Comment" {
@@ -1223,7 +1239,7 @@ test "Parses Well Formed Heading With Some Text and a Comment" {
     }
 }
 
-test "HTML Tag Trivial Correct" {
+test "HTML_TAG Trivial Correct" {
     const wikitext = "<ref>Hello</ref>";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1238,13 +1254,17 @@ test "HTML Tag Trivial Correct" {
     switch (wp.nodes.items[0]) {
         .html_tag => |t| {
             try std.testing.expectEqualStrings("ref", t.tag_name);
-            try std.testing.expectEqualStrings("Hello", t.text.?);
+            try std.testing.expect(t.children.len == 1);
+            switch (t.children.first.?.data) {
+                .text => |txt| try std.testing.expectEqualStrings("Hello", txt),
+                else => unreachable,
+            }
         },
         else => unreachable,
     }
 }
 
-test "HTML Tag Wierd Spacing" {
+test "HTML_TAG Wierd Spacing" {
     const case1: []const u8 = "<ref>Hello</ref>";
     const case2: []const u8 =
         \\<ref   >Hello</ref>
@@ -1278,14 +1298,18 @@ test "HTML Tag Wierd Spacing" {
         switch (wp.nodes.items[0]) {
             .html_tag => |t| {
                 try std.testing.expectEqualStrings("ref", t.tag_name);
-                try std.testing.expectEqualStrings("Hello", t.text.?);
+                try std.testing.expect(t.children.len == 1);
+                switch (t.children.first.?.data) {
+                    .text => |txt| try std.testing.expectEqualStrings("Hello", txt),
+                    else => unreachable,
+                }
             },
             else => unreachable,
         }
     }
 }
 
-test "Decodes HTML Tag Attributes Correctly" {
+test "HTML_TAG decodes attributes correctly" {
     const wikitext = "<ref kind='web'>citation</ref>";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1297,17 +1321,21 @@ test "Decodes HTML Tag Attributes Correctly" {
 
     switch (wp.nodes.items[0]) {
         .html_tag => |t| {
-            try std.testing.expect(t.attrs.?.len == 1);
-            try std.testing.expectEqualStrings("kind", t.attrs.?[0].name);
-            try std.testing.expectEqualStrings("web", t.attrs.?[0].value);
+            try std.testing.expect(t.attrs.len == 1);
+            try std.testing.expectEqualStrings("kind", t.attrs.first.?.data.name);
+            try std.testing.expectEqualStrings("web", t.attrs.first.?.data.value);
             try std.testing.expectEqualStrings("ref", t.tag_name);
-            try std.testing.expectEqualStrings("citation", t.text.?);
+            try std.testing.expect(t.children.len == 1);
+            switch (t.children.first.?.data) {
+                .text => |txt| try std.testing.expectEqualStrings("citation", txt),
+                else => unreachable,
+            }
         },
         else => unreachable,
     }
 }
 
-test "Decodes Tag Attribute without quotes" {
+test "HTML_TAG decodes attribute without quotes" {
     const wikitext = "<ref name=Maine />";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1319,11 +1347,87 @@ test "Decodes Tag Attribute without quotes" {
 
     switch (wp.nodes.items[0]) {
         .html_tag => |t| {
-            try std.testing.expect(t.attrs.?.len == 1);
-            try std.testing.expect(t.text == null);
-            try std.testing.expectEqualStrings("name", t.attrs.?[0].name);
-            try std.testing.expectEqualStrings("Maine", t.attrs.?[0].value);
+            try std.testing.expect(t.attrs.len == 1);
+            try std.testing.expect(t.children.len == 0);
+            try std.testing.expectEqualStrings("name", t.attrs.first.?.data.name);
+            try std.testing.expectEqualStrings("Maine", t.attrs.first.?.data.value);
             try std.testing.expectEqualStrings("ref", t.tag_name);
+        },
+        else => unreachable,
+    }
+}
+
+test "HTML_TAG decodes with nested comment" {
+    const wikitext = "<ref kind='web'>cit<!-- Skip Me -->ation</ref>";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    switch (wp.nodes.items[0]) {
+        .html_tag => |t| {
+            try std.testing.expect(t.attrs.len == 1);
+            try std.testing.expectEqualStrings("kind", t.attrs.first.?.data.name);
+            try std.testing.expectEqualStrings("web", t.attrs.first.?.data.value);
+            try std.testing.expectEqualStrings("ref", t.tag_name);
+            try std.testing.expect(t.children.len == 2);
+            switch (t.children.first.?.data) {
+                .text => |txt| try std.testing.expectEqualStrings("cit", txt),
+                else => unreachable,
+            }
+            switch (t.children.first.?.next.?.data) {
+                .text => |txt| try std.testing.expectEqualStrings("ation", txt),
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+test "HTML_TAG decodes nested tags" {
+    const wikitext = "<div>Start<div>Middle</div>End</div>";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+
+    switch (wp.nodes.items[0]) {
+        .html_tag => |t| {
+            try std.testing.expect(t.attrs.len == 0);
+            try std.testing.expectEqualStrings("div", t.tag_name);
+            try std.testing.expect(t.children.len == 3);
+
+            var n = t.children.first.?;
+            switch (n.*.data) {
+                .text => |txt| try std.testing.expectEqualStrings("Start", txt),
+                else => unreachable,
+            }
+            n = n.next.?;
+            switch (n.*.data) {
+                .html_tag => |_t| {
+                    try std.testing.expectEqualStrings("div", _t.tag_name);
+                    try std.testing.expect(_t.attrs.len == 0);
+                    try std.testing.expect(_t.children.len == 1);
+                    switch (_t.children.first.?.data) {
+                        .text => |txt| try std.testing.expectEqualStrings("Middle", txt),
+                        else => unreachable,
+                    }
+                },
+                else => unreachable,
+            }
+            n = n.next.?;
+            switch (n.*.data) {
+                .text => |txt| try std.testing.expectEqualStrings("End", txt),
+                else => unreachable,
+            }
         },
         else => unreachable,
     }
