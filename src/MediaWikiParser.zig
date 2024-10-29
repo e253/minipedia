@@ -14,7 +14,7 @@ pub const MWNodeType = enum {
 
 pub const MWNode = union(MWNodeType) {
     template: TemplateCtx,
-    wiki_link: []const u8,
+    wiki_link: WikiLinkCtx,
     external_link: ExternalLinkCtx,
     heading: HeadingCtx,
     html_tag: HtmlTagCtx,
@@ -27,6 +27,14 @@ pub const MWNode = union(MWNodeType) {
 pub const ExternalLinkCtx = struct {
     url: []const u8,
     title: ?[]const u8,
+};
+
+pub const WikiLinkCtx = struct {
+    /// actual article to link to
+    article: []const u8,
+    /// text to display to the user.
+    /// `null` when `article` should be displayed directly
+    name: ?[]const u8 = null,
 };
 
 pub const HeadingCtx = struct {
@@ -47,13 +55,8 @@ pub const HtmlTagCtx = struct {
 };
 
 pub const TemplateCtx = struct {
-    pub const TemplateArg = struct {
-        key: ?[]const u8,
-        value: []const u8,
-    };
-
     name: []const u8,
-    args: std.DoublyLinkedList(TemplateArg) = std.DoublyLinkedList(TemplateArg){},
+    args: std.DoublyLinkedList([]const u8) = std.DoublyLinkedList([]const u8){},
     children: std.DoublyLinkedList(TemplateCtx) = std.DoublyLinkedList(TemplateCtx){},
 };
 
@@ -81,6 +84,7 @@ pub const MWParser = struct {
         UnclosedHtmlComment,
         InvalidHtmlTag,
         BadExternalLink,
+        BadWikiLink,
         IncompleteTable,
         BadTemplate,
     };
@@ -113,7 +117,14 @@ pub const MWParser = struct {
                         if (cur_text_node.len > 0)
                             try self.nodes.append(.{ .text = cur_text_node });
 
-                        const res = try self.parseTemplate(i);
+                        const res = self.parseTemplate(i) catch |err| switch (err) {
+                            ParseError.InvalidHtmlTag => {
+                                i = try self.skipTemplate(i);
+                                continue;
+                            },
+                            else => return err,
+                        };
+
                         try self.nodes.append(.{ .template = res.t_ctx });
                         i += res.offset;
 
@@ -136,8 +147,13 @@ pub const MWParser = struct {
                 // wikilink or external link
                 '[' => {
                     if (nextEql(self.raw_wikitext, "[[", i)) {
-                        cur_text_node.len += 1;
-                        i += 1;
+                        if (cur_text_node.len > 0)
+                            try self.nodes.append(.{ .text = cur_text_node });
+
+                        i = try self.parseWikiLink(i);
+
+                        cur_text_node = self.raw_wikitext[i..];
+                        cur_text_node.len = 0;
                     } else {
                         if (cur_text_node.len > 0)
                             try self.nodes.append(.{ .text = cur_text_node });
@@ -203,6 +219,46 @@ pub const MWParser = struct {
             try self.nodes.append(.{ .text = cur_text_node });
     }
 
+    /// skips templates with nesting ...
+    /// Used as a fallback for `parseTemplate` becuase it fails on big tags
+    fn skipTemplate(self: *Self, start: usize) !usize {
+        const FAIL = ParseError.BadTemplate;
+
+        var i = start + "{{".len;
+
+        var depth: usize = 0; // recursion depth
+
+        while (i < self.raw_wikitext.len) {
+            switch (self.raw_wikitext[i]) {
+                '}' => {
+                    if (nextEql(self.raw_wikitext, "{{", i)) {
+                        if (depth == 0) {
+                            return i + "}}".len;
+                        } else {
+                            depth -= 1;
+                            i += "}}".len;
+                            continue;
+                        }
+                    } else {
+                        return FAIL;
+                    }
+                },
+                '{' => {
+                    if (nextEql(self.raw_wikitext, "{{", i)) {
+                        depth += 1;
+                        i += "{{".len;
+                        continue;
+                    } else {
+                        return FAIL;
+                    }
+                },
+                else => i += 1,
+            }
+        }
+
+        return FAIL;
+    }
+
     fn parseTemplate(self: *Self, start: usize) !struct { offset: usize, t_ctx: TemplateCtx } {
         const FAIL = ParseError.BadTemplate;
 
@@ -221,12 +277,10 @@ pub const MWParser = struct {
         // get template name
         const template_name_start = i;
         i = try skip(self.raw_wikitext, template_name_pred, i, FAIL);
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
         const template_name = self.raw_wikitext[template_name_start..i];
 
         // skip whitespace after template name
-        i = try skip(self.raw_wikitext, single_line_whitespace_pred, i, FAIL);
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
+        i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
 
         // if template closes, return it
         if (nextEql(self.raw_wikitext, "}}", i)) {
@@ -237,70 +291,85 @@ pub const MWParser = struct {
         }
 
         const arg_first_pred = struct {
-            /// stop on '\n', '=', '{', '}'
+            /// stop on '{', '}', '|'
             pub fn afp(ch: u8) bool {
                 switch (ch) {
-                    '\n', '=', '{', '}' => return false,
+                    '{', '}', '|' => return false,
                     else => return true,
                 }
             }
         }.afp;
 
-        // if args exist to parse, parse them
-        if (self.raw_wikitext[i] == '|') {
-            i += "|".len;
+        if (self.raw_wikitext[i] != '|')
+            return FAIL;
 
-            const TL = std.DoublyLinkedList(TemplateCtx.TemplateArg);
-            var args = TL{};
-            const CL = std.DoublyLinkedList(TemplateCtx);
-            var children = CL{};
-            while (i < self.raw_wikitext.len) {
-                const arg_start = i;
+        // parse args
+        i += "|".len;
 
-                i = try skip(self.raw_wikitext, arg_first_pred, i, FAIL);
+        const AL = std.DoublyLinkedList([]const u8);
+        var args = AL{};
+        const CL = std.DoublyLinkedList(TemplateCtx);
+        var children = CL{};
 
-                switch (self.raw_wikitext[i]) {
-                    '=' => return FAIL,
-                    '{' => {
-                        if (nextEql(self.raw_wikitext, "{{", i)) {
-                            const res = try self.parseTemplate(i);
-                            const child = try self.a.create(CL.Node);
-                            child.* = .{ .data = res.t_ctx };
-                            children.append(child);
-                            i = res.offset;
-                        } else {
-                            return FAIL;
-                        }
-                    },
-                    '}' => {
-                        if (nextEql(self.raw_wikitext, "}}", i)) {
-                            if (arg_start == i) {
-                                return .{
-                                    .offset = i + "}}".len,
-                                    .t_ctx = .{ .name = template_name, .args = args, .children = children },
-                                };
-                            }
+        var arg_start = i;
 
-                            const arg = try self.a.create(TL.Node);
-                            arg.*.data = .{
-                                .key = null,
-                                .value = self.raw_wikitext[arg_start..i],
+        while (i < self.raw_wikitext.len) {
+            i = try skip(self.raw_wikitext, arg_first_pred, i, FAIL);
+
+            switch (self.raw_wikitext[i]) {
+                '{' => { // attempt to parse argument that is a nested template
+                    if (nextEql(self.raw_wikitext, "{{", i)) {
+                        const res = try self.parseTemplate(i);
+                        const child = try self.a.create(CL.Node);
+                        child.* = .{ .data = res.t_ctx };
+                        children.append(child);
+                        i = res.offset;
+                    } else {
+                        return FAIL;
+                    }
+                },
+                '}' => { // template end
+                    if (nextEql(self.raw_wikitext, "}}", i)) {
+                        if (arg_start == i) { // if child ends template, there's nothing to add
+                            return .{
+                                .offset = i + "}}".len,
+                                .t_ctx = .{
+                                    .name = template_name,
+                                    .args = args,
+                                    .children = children,
+                                },
                             };
+                        } else {
+                            const arg = try self.a.create(AL.Node);
+                            const arg_text = self.raw_wikitext[arg_start..i];
+                            arg.*.data = arg_text;
                             args.append(arg);
 
                             return .{
                                 .offset = i + "}}".len,
-                                .t_ctx = .{ .name = template_name, .args = args, .children = children },
+                                .t_ctx = .{
+                                    .name = template_name,
+                                    .args = args,
+                                    .children = children,
+                                },
                             };
-                        } else {
-                            return FAIL;
                         }
-                    },
-                    '\n' => return FAIL,
-                    else => return FAIL,
-                }
+                    } else {
+                        return FAIL;
+                    }
+                },
+                '|' => { // value only arg end, but more to follow
+                    const arg = try self.a.create(AL.Node);
+                    arg.*.data = self.raw_wikitext[arg_start..i];
+                    args.append(arg);
+
+                    i += "|".len;
+                    arg_start = i;
+                },
+                else => unreachable,
             }
         }
+
         return FAIL;
     }
 
@@ -321,11 +390,64 @@ pub const MWParser = struct {
         return FAIL;
     }
 
+    fn parseWikiLink(self: *Self, start: usize) !usize {
+        const FAIL = ParseError.BadWikiLink;
+
+        // skip [[ and single line whitespace after
+        var i = start + "[[".len;
+        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
+
+        // find end of article
+        const article_start = i;
+        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', '|', ']' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
+        const article_end = i;
+
+        // skip whitespace after article
+        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
+
+        // if link ends return
+        if (self.raw_wikitext[i] == ']') {
+            if (nextEql(self.raw_wikitext, "]]", i)) {
+                try self.nodes.append(.{ .wiki_link = .{
+                    .article = self.raw_wikitext[article_start..article_end],
+                } });
+                return i + "]]".len;
+            } else {
+                return FAIL;
+            }
+        }
+
+        i += "|".len;
+
+        // find display name end
+        const display_name_start = i;
+        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', ']' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
+        const display_name_end = i;
+
+        // skip whitespace after display name
+        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
+
+        if (nextEql(self.raw_wikitext, "]]", i)) {
+            try self.nodes.append(.{ .wiki_link = .{
+                .article = self.raw_wikitext[article_start..article_end],
+                .name = self.raw_wikitext[display_name_start..display_name_end],
+            } });
+            return i + "]]".len;
+        }
+
+        return FAIL;
+    }
+
     fn parseExternalLink(self: *Self, start: usize) !usize {
         const FAIL = ParseError.BadExternalLink;
 
         // skip opening [
-        var i = try advance(start, "[".len, self.raw_wikitext, FAIL);
+        var i = start + "[".len;
 
         // extract url
         const url_start = i;
@@ -650,12 +772,41 @@ pub const MWParser = struct {
     }
 };
 
+/// Skips until `i` exceeds `buf.len` (returning `E`) or a character not in `continues` is found
+inline fn skipWhileOneOf(buf: []const u8, comptime continues: []const u8, i: usize, E: anyerror) !usize {
+    var _i = i;
+
+    while (_i < buf.len) : (_i += 1) {
+        inline for (continues) |c| {
+            if (buf[_i] != c) {
+                return _i;
+            }
+        }
+    }
+
+    return E;
+}
+
+/// Skips until `i` exceeds `buf.len` (returning `E`) or a character in `stops` is found
+inline fn skipUntilOneOf(buf: []const u8, comptime stops: []const u8, i: usize, E: anyerror) !usize {
+    var _i = i;
+
+    while (_i < buf.len) : (_i += 1) {
+        inline for (stops) |stop| {
+            if (buf[_i] == stop)
+                return _i;
+        }
+    }
+
+    return E;
+}
+
 /// Advances `i` until `continue_pred` returns false
 ///
 /// If end of `buf` is reached, returns error `E`
 ///
 /// Predicate calls are inlined for performance
-fn skip(buf: []const u8, continue_pred: fn (u8) bool, _i: usize, E: anyerror) !usize {
+inline fn skip(buf: []const u8, continue_pred: fn (u8) bool, _i: usize, E: anyerror) !usize {
     var i = _i;
     while (i < buf.len) : (i += 1) {
         if (!@call(.always_inline, continue_pred, .{buf[i]})) {
@@ -1159,6 +1310,45 @@ test "External Link With Title" {
     }
 }
 
+test "Wikilink No Title" {
+    const wikitext = "[[Index of Andorra-related articles]]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+    switch (wp.nodes.items[0]) {
+        .wiki_link => |wl| {
+            try std.testing.expectEqualStrings("Index of Andorra-related articles", wl.article);
+        },
+        else => unreachable,
+    }
+}
+
+test "Wikilink With Title" {
+    const wikitext = "[[Andorra–Spain border|Spanish border]]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+    switch (wp.nodes.items[0]) {
+        .wiki_link => |wl| {
+            try std.testing.expectEqualStrings("Andorra–Spain border", wl.article);
+            try std.testing.expectEqualStrings("Spanish border", wl.name.?);
+        },
+        else => unreachable,
+    }
+}
+
 test "Skips Table" {
     const wikitext =
         \\Very Nice Table!
@@ -1239,8 +1429,7 @@ test "Parses Template Non Keyed Argument" {
             try std.testing.expectEqualStrings("Main", temp.name);
             try std.testing.expect(temp.children.len == 0);
             try std.testing.expect(temp.args.len == 1);
-            try std.testing.expect(temp.args.first.?.data.key == null);
-            try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", temp.args.first.?.data.value);
+            try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", temp.args.first.?.data);
         },
         else => unreachable,
     }
@@ -1259,11 +1448,161 @@ test "Parses Template With Child as Arg" {
     try std.testing.expect(wp.nodes.items.len == 1);
 
     switch (wp.nodes.items[0]) {
+        .template => |t| {
+            try std.testing.expectEqualStrings("Main", t.name);
+            try std.testing.expect(t.args.len == 1);
+            try std.testing.expectEqualStrings("{{Definition of anarchism and libertarianism}}", t.args.first.?.data);
+            try std.testing.expect(t.children.len == 1);
+            try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", t.children.first.?.data.name);
+        },
+        else => unreachable,
+    }
+}
+
+test "Parses Template With KV Arg" {
+    const wikitext = "{{Main|date=May 2023}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+
+    switch (wp.nodes.items[0]) {
         .template => |temp| {
             try std.testing.expectEqualStrings("Main", temp.name);
-            try std.testing.expect(temp.args.len == 0);
-            try std.testing.expect(temp.children.len == 1);
-            try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", temp.children.first.?.data.name);
+            try std.testing.expect(temp.children.len == 0);
+            try std.testing.expect(temp.args.len == 1);
+            try std.testing.expectEqualStrings("date=May 2023", temp.args.first.?.data);
+        },
+        else => unreachable,
+    }
+}
+
+test "Skips unparseable (for now) template" {
+    const wikitext =
+        \\{{Infobox country
+        \\| conventional_long_name = Principality of Andorra<ref name="constitution">{{cite web|url=https://www.wipo.int/edocs/lexdocs/laws/en/ad/ad001en.pdf|title=Constitution of the Principality of Andorra|url-status=live|archive-url=https://web.archive.org/web/20190516152108/https://www.wipo.int/edocs/lexdocs/laws/en/ad/ad001en.pdf|archive-date=16 May 2019}}</ref>
+        \\| common_name            = Andorra
+        \\| native_name            = {{native name|ca|Principat d'Andorra}}
+        \\| image_flag             = Flag of Andorra.svg
+        \\| image_coat             = Coat of arms of Andorra.svg
+        \\| symbol_type            = Coat of arms
+        \\| national_motto         = {{lang-la|Virtus Unita Fortior|label=none}}  ([[Latin]])<br />"United virtue is stronger"<ref>{{cite web|url=https://www.worldatlas.com/webimage/countrys/europe/andorra/adsymbols.htm|title=Andorran Symbols|date=29 March 2021|publisher=WorldAtlas}}</ref>
+        \\| national_anthem        = {{native name|ca|[[El Gran Carlemany]]}}<br />"The Great [[Charlemagne]]"<div style="display:inline-block;margin-top:0.4em;">{{center|[[File:El Gran Carlemany.ogg]]}}</div>
+        \\| image_map              = Location Andorra Europe.png
+        \\| map_caption            = {{map caption |location_color=centre of green circle |region=Europe |region_color=dark grey}}
+        \\| image_map2             =
+        \\| capital                = [[Andorra la Vella]]
+        \\| coordinates            = {{coord|42|30|23|N|1|31|17|E|type:city_region:AD|display=inline}}
+        \\| largest_city           = capital
+        \\| official_languages     = [[Catalan language|Catalan]]<ref name="constitution"/> <br />
+        \\| ethnic_groups          = {{plainlist|
+        \\* 48.3% [[Demographics of Andorra|Andorrans]]
+        \\* 24.8% [[Spaniards]]
+        \\* 11.2% [[Portuguese people|Portuguese]]
+        \\* 4.5% [[French people|French]]
+        \\* 1.4% [[Argentines]]
+        \\* 9.8% others
+        \\}}
+        \\| ethnic_groups_year     = 2021<ref name="cia"/>
+        \\| religion               = {{unbulleted list
+        \\|{{Tree list}}
+        \\* 90.8% Christianity
+        \\** 85.5% [[Catholic Church in Andorra|Catholicism]] ([[State religion|official]])<ref>{{cite book|first1=Jeroen|last1= Temperman|title=State–Religion Relationships and Human Rights Law: Towards a Right to Religiously Neutral Governance|publisher=BRILL|year=2010|isbn=9789004181496|quote=...&nbsp;guarantees the Roman Catholic Church free and public exercise of its activities and the preservation of the relations of special co-operation with the state in accordance with the Andorran tradition. The Constitution recognizes the full legal capacity of the bodies of the Roman Catholic Church which have legal status in accordance with their own rules.}}</ref>
+        \\** 5.3% other [[List of Christian denominations|Christian]]
+        \\{{Tree list/end}}
+        \\ | 6.9% [[Irreligion|no religion]]
+        \\ | 2.3% others
+        \\ }}
+        \\| religion_year          = 2020
+        \\| religion_ref           = <ref>{{Cite web|url=https://www.thearda.com/world-religion/national-profiles?u=6c|title=National Profiles &amp;#124; World Religion|website=www.thearda.com}}</ref>
+        \\| demonym                = [[List of Andorrans|Andorran]]
+        \\| government_type        = Unitary [[Parliamentary system|parliamentary diarchic]] constitutional [[Coregency#Andorra|co-principality]]
+        \\| leader_title1          = [[Co-Princes of Andorra|Co-Princes]]
+        \\| leader_name1           = {{plainlist|
+        \\* [[Joan Enric Vives Sicília]]
+        \\* [[Emmanuel Macron]]}}
+        \\| leader_title2          = [[List of Representatives of the Co-Princes of Andorra|Representatives]]
+        \\| leader_name2           = {{plainlist|
+        \\* [[Josep Maria Mauri]]
+        \\* [[Patrick Strzoda]]}}
+        \\| leader_title3          = [[Head of Government of Andorra|Prime Minister]]
+        \\| leader_name3           = [[Xavier Espot Zamora]]
+        \\| leader_title4          = [[List of General Syndics of the General Council|General Syndic]]
+        \\| leader_name4           = [[Carles Enseñat Reig]]
+        \\| legislature            = [[General Council (Andorra)|General Council]]
+        \\| sovereignty_type       = Independence
+        \\| established_event1     = from the [[Crown of Aragon]]
+        \\| established_date1      = [[Paréage of Andorra (1278)|8 September 1278]]<ref>{{cite web | url=https://www.cultura.ad/historia-d-andorra |title = Història d'Andorra|language=ca|website=Cultura.ad|access-date=26 March 2019}}</ref><ref>{{cite web | url=https://www.enciclopedia.cat/EC-GEC-0003858.xml |title = Andorra|language=ca|website=Enciclopèdia.cat|access-date=26 March 2019}}</ref>
+        \\| established_event2     = from the [[Sègre (department)|French Empire]]
+        \\| established_date2      = 1814
+        \\| established_event3     = [[Constitution of Andorra|Constitution]]
+        \\| established_date3      = 2 February 1993
+        \\| area_km2               = 467.63
+        \\| area_rank              = 178th
+        \\| area_sq_mi             = 180.55
+        \\| percent_water          = 0.26 (121.4 [[hectares|ha]]<!-- Not including areas of rivers -->){{efn|{{in lang|fr|cap=yes}} Girard P &amp; Gomez P (2009), Lacs des Pyrénées: Andorre.<ref>{{cite web |url=http://www.estadistica.ad/serveiestudis/publicacions/CD/Anuari/cat/pdf/xifres.PDF |archive-url=https://web.archive.org/web/20091113203301/http://www.estadistica.ad/serveiestudis/publicacions/CD/Anuari/cat/pdf/xifres.PDF |url-status = dead|archive-date=13 November 2009 |title=Andorra en xifres 2007: Situació geogràfica, Departament d'Estadística, Govern d'Andorra |access-date=26 August 2012 }}</ref>}}
+        \\| population_estimate    = {{increase}} 85,863<ref>{{cite web |url=https://www.estadistica.ad/portal/apps/sites/#/estadistica-ca|title=Departament d'Estadística
+        \\|access-date=8 July 2024}}</ref>
+        \\| population_estimate_rank = 185th
+        \\| population_estimate_year = 2023
+        \\| population_census_year = 2021
+        \\| population_density_km2 = 179.8
+        \\| population_density_sq_mi = 465.7
+        \\| population_density_rank = 71st
+        \\| GDP_PPP                = {{increase}} $6.001&nbsp;billion<ref name="IMFWEO.AD">{{cite web |url=https://www.imf.org/en/Publications/WEO/weo-database/2024/April/weo-report?c=111,&amp;s=NGDPD,PPPGDP,NGDPDPC,PPPPC,&amp;sy=2022&amp;ey=2027&amp;ssm=0&amp;scsm=1&amp;scc=0&amp;ssd=1&amp;ssc=0&amp;sic=0&amp;sort=country&amp;ds=.&amp;br=1 |title=Report for Selected Countries and Subjects: April 2024|publisher=[[International Monetary Fund]]|website=imf.org}}</ref>
+        \\| GDP_PPP_year           = 2024
+        \\| GDP_PPP_rank           = 168th
+        \\| GDP_PPP_per_capita     = {{increase}} $69,146<ref name="IMFWEO.AD" />
+        \\| GDP_PPP_per_capita_rank = 18th
+        \\| GDP_nominal            = {{increase}} $3.897&nbsp;billion<ref name="IMFWEO.AD" />
+        \\| GDP_nominal_year       = 2024
+        \\| GDP_nominal_rank       = 159th
+        \\| GDP_nominal_per_capita = {{increase}} $44,900<ref name="IMFWEO.AD" />
+        \\| GDP_nominal_per_capita_rank = 24th
+        \\| Gini                   = 27.21
+        \\| Gini_year              = 2003
+        \\| Gini_ref               = {{efn|Informe sobre l'estat de la pobresa i la desigualtat al Principal d'Andorra (2003)<ref>{{cite web |url=http://www.estadistica.ad/serveiestudis/publicacions/Publicacions/Pobresa.pdf |title=Informe sobre l'estat de la pobresa i la desigualtat al Principal d'Andorra (2003) |publisher=Estadistica.ad |access-date=25 November 2012 |archive-url=https://web.archive.org/web/20130810122415/http://www.estadistica.ad/serveiestudis/publicacions/Publicacions/Pobresa.pdf |archive-date=10 August 2013 |url-status = dead}}</ref>}}
+        \\| HDI                    = 0.884<!-- number only -->
+        \\| HDI_year               = 2022 <!-- Please use the year to which the data refers, not the publication year -->
+        \\| HDI_change             = increase<!-- increase/decrease/steady -->
+        \\| HDI_ref                = <ref name="UNHDR">{{cite web|url=https://hdr.undp.org/system/files/documents/global-report-document/hdr2023-24reporten.pdf|title=Human Development Report 2023/24|language=en|publisher=[[United Nations Development Programme]]|date=13 March 2024|access-date=13 March 2024}}</ref>
+        \\| HDI_rank               = 35th
+        \\| currency               = [[Euro]] ([[Euro sign|€]]){{efn|Before 1999, the [[French franc]] and [[Spanish peseta]]; the coins and notes of both currencies, however, remained legal tender until 2002. Small amounts of [[Andorran diner]]s (divided into 100 centim) were minted after 1982.}}
+        \\| currency_code          = EUR
+        \\| time_zone              = [[Central European Time|CET]]
+        \\| utc_offset             = +01
+        \\| utc_offset_DST         = +02
+        \\| time_zone_DST          = [[Central European Summer Time|CEST]]
+        \\| date_format            = dd/mm/yyyy
+        \\| drives_on              = right<ref name="DRIVESIDE">{{cite web |url=http://whatsideofroad.com/ad/ |title=What side of the road do they drive on in Andorra |access-date=19 March 2019 }}{{Dead link|date=September 2019 |bot=InternetArchiveBot |fix-attempted=yes }}</ref>
+        \\| calling_code           = [[Telephone numbers in Andorra|+376]]
+        \\| cctld                  = [[.ad]]{{efn|Also [[.cat]], shared with [[Països Catalans|Catalan-speaking territories]].}}
+        \\| today                  =
+        \\}}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+
+    switch (wp.nodes.items[0]) {
+        .template => |t| {
+            // arguments don't always parse correclty with current logic
+            //try std.testing.expectEqualStrings(
+            //    " conventional_long_name = Principality of Andorra<ref name="constitution">{{cite web|url=https://www.wipo.int/edocs/lexdocs/laws/en/ad/ad001en.pdf|title=Constitution of the Principality of Andorra|url-status=live|archive-url=https://web.archive.org/web/20190516152108/https://www.wipo.int/edocs/lexdocs/laws/en/ad/ad001en.pdf|archive-date=16 May 2019}}</ref>\n",
+            //    t.args.first.?.data,
+            //);
+            try std.testing.expectEqualStrings("Infobox country", t.name);
         },
         else => unreachable,
     }
