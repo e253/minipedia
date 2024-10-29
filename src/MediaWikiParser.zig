@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_options = .{ .log_level = .debug };
 
 pub const MWNodeType = enum {
     template, // {{}}
@@ -118,9 +119,9 @@ pub const MWParser = struct {
                             try self.nodes.append(.{ .text = cur_text_node });
 
                         const res = self.parseTemplate(i) catch |err| switch (err) {
-                            ParseError.InvalidHtmlTag => {
-                                i = try self.skipTemplate(i);
-                                continue;
+                            ParseError.BadTemplate => {
+                                std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
+                                return err;
                             },
                             else => return err,
                         };
@@ -174,8 +175,7 @@ pub const MWParser = struct {
                     } else {
                         i = self.parseHtmlTag(i) catch |err| switch (err) {
                             error.InvalidHtmlTag => {
-                                // TODO: Better error reporting
-                                //std.debug.print("InvalidHtmlTag\n{s}\n", .{self.raw_wikitext[i - 30 .. i + 30]});
+                                std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
                                 return err;
                             },
                             else => return err,
@@ -495,7 +495,9 @@ pub const MWParser = struct {
     ///
     /// `i` should point to the opening `<`
     ///
-    /// TODO: handle nesting. Errors right now!
+    /// TODO: handle nesting
+    ///
+    /// TODO: handle wrapped templates
     fn parseHtmlTag(self: *Self, start: usize) !usize {
         const FAIL = ParseError.InvalidHtmlTag;
 
@@ -530,28 +532,32 @@ pub const MWParser = struct {
             // skip '='
             if (self.raw_wikitext[i] != '=')
                 return FAIL;
-            i = try advance(i, "=".len, self.raw_wikitext, FAIL);
+            i += "=".len;
 
             // skip whitespace after =
-            i = try skip(self.raw_wikitext, whitespace_pred, i, FAIL);
+            i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
 
-            // skip quote and remember if it was ' or "
-            const quote = self.raw_wikitext[i];
-            if (i + 1 == self.raw_wikitext.len or (quote != '\'' and quote != '"'))
-                return FAIL;
-            i = try advance(i, 1, self.raw_wikitext, FAIL);
+            // skip quote and remember if it was ' or " or not present
+            var quote: u8 = self.raw_wikitext[i];
+            if (quote == '"' or quote == '\'') {
+                i += 1;
+            } else {
+                quote = 0;
+            }
 
             // get attr value
             const attr_value_start = i;
             switch (quote) {
                 '\'' => i = try skip(self.raw_wikitext, attribute_value_single_quote_pred, i, FAIL),
                 '"' => i = try skip(self.raw_wikitext, attribute_value_double_quote_pred, i, FAIL),
+                0 => i = try skipUntilOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL),
                 else => unreachable,
             }
             const attr_value = self.raw_wikitext[attr_value_start..i];
 
-            // skip last quote
-            i = try advance(i, 1, self.raw_wikitext, FAIL);
+            // skip quote if it existed
+            if (quote != 0)
+                i += 1;
 
             try attrs.append(.{ .name = attr_name, .value = attr_value });
 
@@ -581,7 +587,7 @@ pub const MWParser = struct {
                     .attrs = null,
                 } });
             }
-            return try advance(i, "/>".len, self.raw_wikitext, FAIL);
+            return i + "/>".len;
         }
 
         // skip closing '>'
@@ -939,6 +945,21 @@ inline fn nextEqlCount(buf: []const u8, ch: u8, count: usize, _i: usize) bool {
     return false;
 }
 
+/// get 30 chars before problems and 30 chars after if buf allows
+inline fn getErrContext(buf: []const u8, i: usize) []const u8 {
+    const start = blk: {
+        if (i < 30)
+            break :blk 0;
+        break :blk i - 30;
+    };
+    const end = blk: {
+        if (i + 30 >= buf.len)
+            break :blk buf.len;
+        break :blk i + 30;
+    };
+    return buf[start..end];
+}
+
 test "Trivial nextEql" {
     const wikitext =
         \\{{{arg}}
@@ -1286,7 +1307,29 @@ test "Decodes HTML Tag Attributes Correctly" {
     }
 }
 
-// Unsure if this will ever pass due to <> present within the tag
+test "Decodes Tag Attribute without quotes" {
+    const wikitext = "<ref name=Maine />";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    switch (wp.nodes.items[0]) {
+        .html_tag => |t| {
+            try std.testing.expect(t.attrs.?.len == 1);
+            try std.testing.expect(t.text == null);
+            try std.testing.expectEqualStrings("name", t.attrs.?[0].name);
+            try std.testing.expectEqualStrings("Maine", t.attrs.?[0].value);
+            try std.testing.expectEqualStrings("ref", t.tag_name);
+        },
+        else => unreachable,
+    }
+}
+
+// Needs support for parsing templates as templates within html tags
 test "Real Ref Tag 1" {
     //const wikitext =
     //    \\<ref name="Winston">{{cite journal| first=Jay |last=Winston |title=The Annual Course of Zonal Mean Albedo as Derived From ESSA 3 and 5 Digitized Picture Data |journal=Monthly Weather Review |volume=99 |pages=818–827| bibcode=1971MWRv...99..818W| date=1971| doi=10.1175/1520-0493(1971)099<0818:TACOZM>2.3.CO;2| issue=11|doi-access=free}}</ref>"

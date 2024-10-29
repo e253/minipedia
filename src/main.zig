@@ -4,6 +4,8 @@ const SliceArray = @import("slice_array.zig").SliceArray;
 const lzma = @import("lzma.zig");
 const MWParser = @import("MediaWikiParser.zig").MWParser;
 
+pub const std_options = .{ .log_level = .debug };
+
 pub fn main() !void {
     const args = try Args.parse();
 
@@ -86,7 +88,7 @@ pub fn main() !void {
                 PE.InvalidHtmlTag,
                 PE.UnclosedHtmlComment,
                 => {
-                    std.debug.print("Article ID: {} ... {s}\n", .{ n_articles_processed, @errorName(err) });
+                    std.log.warn("Article ID: {} ... {s}", .{ n_articles_processed, @errorName(err) });
                     break :blk preProcessedArticle;
                 },
                 else => return err,
@@ -219,8 +221,7 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
     return try sa.toSlice();
 }
 
-/// Uses `MWParser` to separate the wikicode into elements
-///
+/// Uses `MWParser` to convert Wikicode AST to more concise and clean text
 fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8) ![]const u8 {
     var wp = MWParser.init(a, raw_wikitext);
     try wp.parse();
