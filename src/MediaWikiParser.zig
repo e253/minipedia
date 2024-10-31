@@ -27,7 +27,7 @@ pub const MWNode = union(MWNodeType) {
 
 pub const ExternalLinkCtx = struct {
     url: []const u8,
-    title: ?[]const u8,
+    title: ?[]const u8 = null,
 };
 
 pub const WikiLinkCtx = struct {
@@ -171,10 +171,11 @@ pub const MWParser = struct {
                         if (cur_text_node.len > 0)
                             try self.nodes.append(.{ .text = cur_text_node });
 
-                        i = self.parseWikiLink(i) catch |err| {
+                        i, const wkl_ctx = self.parseWikiLink(i) catch |err| {
                             std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
                             return err;
                         };
+                        try self.nodes.append(.{ .wiki_link = wkl_ctx });
 
                         cur_text_node = self.raw_wikitext[i..];
                         cur_text_node.len = 0;
@@ -182,10 +183,11 @@ pub const MWParser = struct {
                         if (cur_text_node.len > 0)
                             try self.nodes.append(.{ .text = cur_text_node });
 
-                        i = self.parseExternalLink(i) catch |err| {
+                        i, const el_ctx = self.parseExternalLink(i) catch |err| {
                             std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
                             return err;
                         };
+                        try self.nodes.append(.{ .external_link = el_ctx });
 
                         cur_text_node = self.raw_wikitext[i..];
                         cur_text_node.len = 0;
@@ -197,7 +199,7 @@ pub const MWParser = struct {
                         try self.nodes.append(.{ .text = cur_text_node });
 
                     if (nextEql(self.raw_wikitext, "!--", i + 1)) {
-                        i = self.skipHtmlComment(i + "<!--".len) catch |err| {
+                        i = self.skipHtmlComment(i) catch |err| {
                             std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
                             return err;
                         };
@@ -309,7 +311,7 @@ pub const MWParser = struct {
 
         var arg = TemplateCtx.Arg{};
 
-        var i = start;
+        var i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, start, FAIL);
 
         const arg_start = i;
         var arg_name_end_opt: ?usize = null;
@@ -350,7 +352,7 @@ pub const MWParser = struct {
                                 try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
                             );
                         if (arg_name_end_opt) |arg_name_end|
-                            arg.name = self.raw_wikitext[arg_start..arg_name_end];
+                            arg.name = std.mem.trimRight(u8, self.raw_wikitext[arg_start..arg_name_end], &.{ ' ', '\t', '\n' });
                         return .{ i + "}}".len, arg, true };
                     } else { // continue with } as text
                         i += 1;
@@ -384,8 +386,29 @@ pub const MWParser = struct {
                             try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
                         );
                     if (arg_name_end_opt) |arg_name_end|
-                        arg.name = self.raw_wikitext[arg_start..arg_name_end];
+                        arg.name = std.mem.trimRight(u8, self.raw_wikitext[arg_start..arg_name_end], &.{ ' ', '\t', '\n' });
                     return .{ i + "|".len, arg, false };
+                },
+                '[' => { // link
+                    if (cur_text_node.len > 0)
+                        arg.values.append(
+                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
+                        );
+
+                    if (nextEql(self.raw_wikitext, "[[", i)) {
+                        i, const wkl_ctx = try self.parseWikiLink(i);
+                        arg.values.append(
+                            try newNode(self.a, ValueNode, .{ .wiki_link = wkl_ctx }),
+                        );
+                    } else {
+                        i, const el_ctx = try self.parseExternalLink(i);
+                        arg.values.append(
+                            try newNode(self.a, ValueNode, .{ .external_link = el_ctx }),
+                        );
+                    }
+
+                    cur_text_node = self.raw_wikitext[i..];
+                    cur_text_node.len = 0;
                 },
                 else => {
                     i += 1;
@@ -413,7 +436,7 @@ pub const MWParser = struct {
         return FAIL;
     }
 
-    fn parseWikiLink(self: *Self, start: usize) !usize {
+    fn parseWikiLink(self: *Self, start: usize) ParseError!struct { usize, WikiLinkCtx } {
         const FAIL = ParseError.BadWikiLink;
 
         // skip [[ and single line whitespace after
@@ -425,7 +448,7 @@ pub const MWParser = struct {
         const article_start = i;
         i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', '|', ']' }, i, FAIL);
         try errOnLineBreak(self.raw_wikitext[i], FAIL);
-        const article_end = i;
+        const article_text = self.raw_wikitext[article_start..i];
 
         // skip whitespace after article
         i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
@@ -433,14 +456,9 @@ pub const MWParser = struct {
 
         // if link ends return
         if (self.raw_wikitext[i] == ']') {
-            if (nextEql(self.raw_wikitext, "]]", i)) {
-                try self.nodes.append(.{ .wiki_link = .{
-                    .article = self.raw_wikitext[article_start..article_end],
-                } });
-                return i + "]]".len;
-            } else {
-                return FAIL;
-            }
+            if (nextEql(self.raw_wikitext, "]]", i))
+                return .{ i + "]]".len, .{ .article = article_text } };
+            return FAIL;
         }
 
         i += "|".len;
@@ -449,24 +467,19 @@ pub const MWParser = struct {
         const display_name_start = i;
         i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', ']' }, i, FAIL);
         try errOnLineBreak(self.raw_wikitext[i], FAIL);
-        const display_name_end = i;
+        const display_name = self.raw_wikitext[display_name_start..i];
 
         // skip whitespace after display name
         i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
         try errOnLineBreak(self.raw_wikitext[i], FAIL);
 
-        if (nextEql(self.raw_wikitext, "]]", i)) {
-            try self.nodes.append(.{ .wiki_link = .{
-                .article = self.raw_wikitext[article_start..article_end],
-                .name = self.raw_wikitext[display_name_start..display_name_end],
-            } });
-            return i + "]]".len;
-        }
+        if (nextEql(self.raw_wikitext, "]]", i))
+            return .{ i + "]]".len, .{ .article = article_text, .name = display_name } };
 
         return FAIL;
     }
 
-    fn parseExternalLink(self: *Self, start: usize) !usize {
+    fn parseExternalLink(self: *Self, start: usize) ParseError!struct { usize, ExternalLinkCtx } {
         const FAIL = ParseError.BadExternalLink;
 
         // skip opening [
@@ -483,13 +496,8 @@ pub const MWParser = struct {
         try errOnLineBreak(self.raw_wikitext[i], FAIL);
 
         // if no name found, return
-        if (self.raw_wikitext[i] == ']') {
-            try self.nodes.append(.{ .external_link = .{
-                .url = url,
-                .title = null,
-            } });
-            return i + 1;
-        }
+        if (self.raw_wikitext[i] == ']')
+            return .{ i + 1, .{ .url = url } };
 
         // get display name
         const name_start = i;
@@ -500,11 +508,7 @@ pub const MWParser = struct {
         if (self.raw_wikitext[i] != ']')
             return FAIL;
 
-        try self.nodes.append(.{ .external_link = .{
-            .url = url,
-            .title = name,
-        } });
-        return i + 1;
+        return .{ i + 1, .{ .url = url, .title = name } };
     }
 
     /// **Internal WIP**
@@ -655,7 +659,7 @@ pub const MWParser = struct {
                         try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = cur_text_node }),
                     );
 
-                i = try self.skipHtmlComment(i + "<!--".len);
+                i = try self.skipHtmlComment(i);
 
                 cur_text_node = self.raw_wikitext[i..];
                 cur_text_node.len = 0;
@@ -697,11 +701,11 @@ pub const MWParser = struct {
     /// moves to `i` to after the comment,
     /// or returns `ParseError.UnclosedHtmlComment` if none is found
     ///
-    /// `i` should point to the first char after `<!--`
+    /// `i` should point to the first char of `<!--`
     fn skipHtmlComment(self: *Self, start: usize) !usize {
         const FAIL = ParseError.UnclosedHtmlComment;
 
-        var i = start;
+        var i = start + "<!--".len;
         while (i < self.raw_wikitext.len) : (i += 1) {
             const ch = self.raw_wikitext[i];
             if (ch == '-') {
@@ -760,7 +764,9 @@ pub const MWParser = struct {
 
     /// called on `start` pointing to '=' at the start of the line
     /// or start of an article.
-    fn parseHeading(self: *Self, start: usize) !usize {
+    ///
+    /// Skips inline html elements
+    fn parseHeading(self: *Self, start: usize) ParseError!usize {
         const FAIL = ParseError.IncompleteHeading;
 
         var i: usize = start;
@@ -771,32 +777,42 @@ pub const MWParser = struct {
             const ch = self.raw_wikitext[i];
             switch (ch) {
                 '=' => level += 1,
-                '\n', '\r' => return FAIL,
+                '\n' => return FAIL,
                 else => break,
             }
         }
 
-        const text_start = i;
+        const text_start = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
+        try errOnLineBreak(self.raw_wikitext[i], FAIL);
 
-        // find next '='
-        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', '=' }, i, FAIL);
-        if (self.raw_wikitext[i] == '\n' or self.raw_wikitext[i] == '\r')
-            return FAIL;
+        var cur_text_node = self.raw_wikitext[i..];
+        cur_text_node.len = 0;
 
-        // verify heading is closed by `level` `=` chars
-        if (!nextEqlCount(self.raw_wikitext, '=', level, i))
-            return FAIL;
+        while (i < self.raw_wikitext.len) {
+            const ch = self.raw_wikitext[i];
+            switch (ch) {
+                '<' => { // skip html tag
+                    i, _ = try self.parseHtmlTag(i);
+                },
+                '=' => { // end of heading
+                    const text = std.mem.trimRight(u8, self.raw_wikitext[text_start..i], &.{ ' ', '\t' });
 
-        const text = self.raw_wikitext[text_start..i];
+                    if (!nextEqlCount(self.raw_wikitext, '=', level, i))
+                        return FAIL;
 
-        // skip '=', test if followed by '\n'
-        i = try advance(i, level, self.raw_wikitext, FAIL);
-        if (self.raw_wikitext[i] != '\n')
-            return FAIL;
+                    i = try advance(i, level, self.raw_wikitext, FAIL);
+                    if (self.raw_wikitext[i] != '\n')
+                        return FAIL;
 
-        try self.nodes.append(.{ .heading = .{ .heading = text, .level = level } });
+                    try self.nodes.append(.{ .heading = .{ .heading = text, .level = level } });
+                    return i;
+                },
+                '\n' => return FAIL,
+                else => i += 1,
+            }
+        }
 
-        return i;
+        return FAIL;
     }
 
     /// Returns size of the node
@@ -894,7 +910,7 @@ inline fn isDigit(ch: u8) bool {
 }
 
 /// returns `E` if `ch` is `\n`
-inline fn errOnLineBreak(ch: u8, E: anyerror) !void {
+inline fn errOnLineBreak(ch: u8, E: MWParser.ParseError) MWParser.ParseError!void {
     if (ch == '\n')
         return E;
 }
@@ -1015,7 +1031,7 @@ test "Parses Well Formed Argument With Some Text" {
     }
 }
 
-test "Rejects Various Malformed Headings" {
+test "HEADING rejects malformed headings" {
     const unclosed1: []const u8 =
         \\== Anarchism
         \\
@@ -1050,7 +1066,7 @@ test "Rejects Various Malformed Headings" {
     }
 }
 
-test "Parses Well Formed Heading With Some Text" {
+test "HEADING well formed with some text" {
     const wikitext =
         \\= Blah Blah Blah =
         \\Blah Blah Blah
@@ -1072,7 +1088,7 @@ test "Parses Well Formed Heading With Some Text" {
 
     switch (wp.nodes.items[0]) {
         .heading => |h| {
-            try std.testing.expectEqualStrings(" Blah Blah Blah ", h.heading);
+            try std.testing.expectEqualStrings("Blah Blah Blah", h.heading);
             try std.testing.expect(h.level == 1);
         },
         else => unreachable,
@@ -1084,19 +1100,35 @@ test "Parses Well Formed Heading With Some Text" {
     }
 }
 
-test "Parses Heading with embedded html with attributes" {
-    //const wikitext =
-    //    \\=== Computing <span class="anchor" id="Computing codes"></span> ==="
-    //;
+test "HEADING embedded html with attributes" {
+    const wikitext =
+        \\=== Computing <span class="anchor" id="Computing codes"></span> ===
+        \\
+    ;
 
-    //var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    //defer arena.deinit();
-    //const a = arena.allocator();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-    //var wp = MWParser.init(a, wikitext);
-    //try wp.parse();
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
 
-    return error.SkipZigTest;
+    try std.testing.expect(wp.nodes.items.len == 2);
+
+    switch (wp.nodes.items[0]) {
+        .heading => |h| {
+            try std.testing.expect(h.level == 3);
+            try std.testing.expectEqualStrings("Computing <span class=\"anchor\" id=\"Computing codes\"></span>", h.heading);
+        },
+        else => unreachable,
+    }
+
+    switch (wp.nodes.items[1]) {
+        .text => |t| {
+            try std.testing.expectEqualStrings("\n", t);
+        },
+        else => unreachable,
+    }
 }
 
 test "Rejects various malformed html entities" {
@@ -1190,7 +1222,7 @@ test "Parses Well Formed Heading With Some Text and a Comment" {
 
     switch (wp.nodes.items[0]) {
         .heading => |h| {
-            try std.testing.expectEqualStrings(" Blah Blah Blah ", h.heading);
+            try std.testing.expectEqualStrings("Blah Blah Blah", h.heading);
             try std.testing.expect(h.level == 1);
         },
         else => unreachable,
@@ -1659,6 +1691,59 @@ test "TEMPLATE parses with KV arg" {
     }
 }
 
+test "TEMPLATE html comment ends KV arg" {
+    const wikitext =
+        \\{{Infobox region symbols|country=United States
+        \\|bird = [[Northern flicker|Yellowhammer]], [[wild turkey]]<!--State game bird-->
+        \\|butterfly= [[Eastern tiger swallowtail]]
+        \\}}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+
+    switch (wp.nodes.items[0]) {
+        .template => |tmpl| {
+            try std.testing.expect(tmpl.args.len == 3);
+
+            const arg2 = tmpl.args.first.?.next.?;
+            try std.testing.expectEqualStrings("bird", arg2.data.name.?);
+            try std.testing.expect(arg2.data.values.len == 5);
+
+            const value1 = arg2.data.values.first.?;
+            switch (value1.data) {
+                .text => |txt| try std.testing.expectEqualStrings(" ", txt),
+                else => unreachable,
+            }
+
+            const value2 = value1.next.?;
+            switch (value2.data) {
+                .wiki_link => |wl_ctx| {
+                    try std.testing.expectEqualStrings("Northern flicker", wl_ctx.article);
+                    try std.testing.expectEqualStrings("Yellowhammer", wl_ctx.name.?);
+                },
+                else => unreachable,
+            }
+
+            const value4 = value2.next.?.next.?;
+            switch (value4.data) {
+                .wiki_link => |wl_ctx| {
+                    try std.testing.expectEqualStrings("wild turkey", wl_ctx.article);
+                    try std.testing.expect(wl_ctx.name == null);
+                },
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
 test "TEMPLATE large country infobox" {
     const wikitext =
         \\{{Infobox country
@@ -1722,48 +1807,47 @@ test "TEMPLATE large country infobox" {
         \\| area_km2               = 467.63
         \\| area_rank              = 178th
         \\| area_sq_mi             = 180.55
+        \\| percent_water          = 0.26 (121.4 [[hectares|ha]]<!-- Not including areas of rivers -->){{efn|{{in lang|fr|cap=yes}} Girard P &amp; Gomez P (2009), Lacs des Pyrénées: Andorre.<ref>{{cite web |url=http://www.estadistica.ad/serveiestudis/publicacions/CD/Anuari/cat/pdf/xifres.PDF |archive-url=https://web.archive.org/web/20091113203301/http://www.estadistica.ad/serveiestudis/publicacions/CD/Anuari/cat/pdf/xifres.PDF |url-status = dead|archive-date=13 November 2009 |title=Andorra en xifres 2007: Situació geogràfica, Departament d'Estadística, Govern d'Andorra |access-date=26 August 2012 }}</ref>}}
+        \\| population_estimate    = {{increase}} 85,863<ref>{{cite web |url=https://www.estadistica.ad/portal/apps/sites/#/estadistica-ca|title=Departament d'Estadística
+        \\|access-date=8 July 2024}}</ref>
+        \\| population_estimate_rank = 185th
+        \\| population_estimate_year = 2023
+        \\| population_census_year = 2021
+        \\| population_density_km2 = 179.8
+        \\| population_density_sq_mi = 465.7
+        \\| population_density_rank = 71st
+        \\| GDP_PPP                = {{increase}} $6.001&nbsp;billion<ref name="IMFWEO.AD">{{cite web |url=https://www.imf.org/en/Publications/WEO/weo-database/2024/April/weo-report?c=111,&amp;s=NGDPD,PPPGDP,NGDPDPC,PPPPC,&amp;sy=2022&amp;ey=2027&amp;ssm=0&amp;scsm=1&amp;scc=0&amp;ssd=1&amp;ssc=0&amp;sic=0&amp;sort=country&amp;ds=.&amp;br=1 |title=Report for Selected Countries and Subjects: April 2024|publisher=[[International Monetary Fund]]|website=imf.org}}</ref>
+        \\| GDP_PPP_year           = 2024
+        \\| GDP_PPP_rank           = 168th
+        \\| GDP_PPP_per_capita     = {{increase}} $69,146<ref name="IMFWEO.AD" />
+        \\| GDP_PPP_per_capita_rank = 18th
+        \\| GDP_nominal            = {{increase}} $3.897&nbsp;billion<ref name="IMFWEO.AD" />
+        \\| GDP_nominal_year       = 2024
+        \\| GDP_nominal_rank       = 159th
+        \\| GDP_nominal_per_capita = {{increase}} $44,900<ref name="IMFWEO.AD" />
+        \\| GDP_nominal_per_capita_rank = 24th
+        \\| Gini                   = 27.21
+        \\| Gini_year              = 2003
+        \\| Gini_ref               = {{efn|Informe sobre l'estat de la pobresa i la desigualtat al Principal d'Andorra (2003)<ref>{{cite web |url=http://www.estadistica.ad/serveiestudis/publicacions/Publicacions/Pobresa.pdf |title=Informe sobre l'estat de la pobresa i la desigualtat al Principal d'Andorra (2003) |publisher=Estadistica.ad |access-date=25 November 2012 |archive-url=https://web.archive.org/web/20130810122415/http://www.estadistica.ad/serveiestudis/publicacions/Publicacions/Pobresa.pdf |archive-date=10 August 2013 |url-status = dead}}</ref>}}
+        \\| HDI                    = 0.884<!-- number only -->
+        \\| HDI_year               = 2022 <!-- Please use the year to which the data refers, not the publication year -->
+        \\| HDI_change             = increase<!-- increase/decrease/steady -->
+        \\| HDI_ref                = <ref name="UNHDR">{{cite web|url=https://hdr.undp.org/system/files/documents/global-report-document/hdr2023-24reporten.pdf|title=Human Development Report 2023/24|language=en|publisher=[[United Nations Development Programme]]|date=13 March 2024|access-date=13 March 2024}}</ref>
+        \\| HDI_rank               = 35th
+        \\| currency               = [[Euro]] ([[Euro sign|€]]){{efn|Before 1999, the [[French franc]] and [[Spanish peseta]]; the coins and notes of both currencies, however, remained legal tender until 2002. Small amounts of [[Andorran diner]]s (divided into 100 centim) were minted after 1982.}}
+        \\| currency_code          = EUR
+        \\| time_zone              = [[Central European Time|CET]]
+        \\| utc_offset             = +01
+        \\| utc_offset_DST         = +02
+        \\| time_zone_DST          = [[Central European Summer Time|CEST]]
+        \\| date_format            = dd/mm/yyyy
+        \\| drives_on              = right<ref name="DRIVESIDE">{{cite web |url=http://whatsideofroad.com/ad/ |title=What side of the road do they drive on in Andorra |access-date=19 March 2019 }}{{Dead link|date=September 2019 |bot=InternetArchiveBot |fix-attempted=yes }}</ref>
+        \\| calling_code           = [[Telephone numbers in Andorra|+376]]
+        \\| cctld                  = [[.ad]]{{efn|Also [[.cat]], shared with [[Països Catalans|Catalan-speaking territories]].}}
+        \\| today                  =
         \\}}
     ;
-    //\\| percent_water          = 0.26 (121.4 [[hectares|ha]]<!-- Not including areas of rivers -->){{efn|{{in lang|fr|cap=yes}} Girard P &amp; Gomez P (2009), Lacs des Pyrénées: Andorre.<ref>{{cite web |url=http://www.estadistica.ad/serveiestudis/publicacions/CD/Anuari/cat/pdf/xifres.PDF |archive-url=https://web.archive.org/web/20091113203301/http://www.estadistica.ad/serveiestudis/publicacions/CD/Anuari/cat/pdf/xifres.PDF |url-status = dead|archive-date=13 November 2009 |title=Andorra en xifres 2007: Situació geogràfica, Departament d'Estadística, Govern d'Andorra |access-date=26 August 2012 }}</ref>}}
-    //    \\| population_estimate    = {{increase}} 85,863<ref>{{cite web |url=https://www.estadistica.ad/portal/apps/sites/#/estadistica-ca|title=Departament d'Estadística
-    //    \\|access-date=8 July 2024}}</ref>
-    //    \\| population_estimate_rank = 185th
-    //    \\| population_estimate_year = 2023
-    //    \\| population_census_year = 2021
-    //    \\| population_density_km2 = 179.8
-    //    \\| population_density_sq_mi = 465.7
-    //    \\| population_density_rank = 71st
-    //    \\| GDP_PPP                = {{increase}} $6.001&nbsp;billion<ref name="IMFWEO.AD">{{cite web |url=https://www.imf.org/en/Publications/WEO/weo-database/2024/April/weo-report?c=111,&amp;s=NGDPD,PPPGDP,NGDPDPC,PPPPC,&amp;sy=2022&amp;ey=2027&amp;ssm=0&amp;scsm=1&amp;scc=0&amp;ssd=1&amp;ssc=0&amp;sic=0&amp;sort=country&amp;ds=.&amp;br=1 |title=Report for Selected Countries and Subjects: April 2024|publisher=[[International Monetary Fund]]|website=imf.org}}</ref>
-    //    \\| GDP_PPP_year           = 2024
-    //    \\| GDP_PPP_rank           = 168th
-    //    \\| GDP_PPP_per_capita     = {{increase}} $69,146<ref name="IMFWEO.AD" />
-    //    \\| GDP_PPP_per_capita_rank = 18th
-    //    \\| GDP_nominal            = {{increase}} $3.897&nbsp;billion<ref name="IMFWEO.AD" />
-    //    \\| GDP_nominal_year       = 2024
-    //    \\| GDP_nominal_rank       = 159th
-    //    \\| GDP_nominal_per_capita = {{increase}} $44,900<ref name="IMFWEO.AD" />
-    //    \\| GDP_nominal_per_capita_rank = 24th
-    //    \\| Gini                   = 27.21
-    //    \\| Gini_year              = 2003
-    //    \\| Gini_ref               = {{efn|Informe sobre l'estat de la pobresa i la desigualtat al Principal d'Andorra (2003)<ref>{{cite web |url=http://www.estadistica.ad/serveiestudis/publicacions/Publicacions/Pobresa.pdf |title=Informe sobre l'estat de la pobresa i la desigualtat al Principal d'Andorra (2003) |publisher=Estadistica.ad |access-date=25 November 2012 |archive-url=https://web.archive.org/web/20130810122415/http://www.estadistica.ad/serveiestudis/publicacions/Publicacions/Pobresa.pdf |archive-date=10 August 2013 |url-status = dead}}</ref>}}
-    //    \\| HDI                    = 0.884<!-- number only -->
-    //    \\| HDI_year               = 2022 <!-- Please use the year to which the data refers, not the publication year -->
-    //    \\| HDI_change             = increase<!-- increase/decrease/steady -->
-    //    \\| HDI_ref                = <ref name="UNHDR">{{cite web|url=https://hdr.undp.org/system/files/documents/global-report-document/hdr2023-24reporten.pdf|title=Human Development Report 2023/24|language=en|publisher=[[United Nations Development Programme]]|date=13 March 2024|access-date=13 March 2024}}</ref>
-    //    \\| HDI_rank               = 35th
-    //    \\| currency               = [[Euro]] ([[Euro sign|€]]){{efn|Before 1999, the [[French franc]] and [[Spanish peseta]]; the coins and notes of both currencies, however, remained legal tender until 2002. Small amounts of [[Andorran diner]]s (divided into 100 centim) were minted after 1982.}}
-    //    \\| currency_code          = EUR
-    //    \\| time_zone              = [[Central European Time|CET]]
-    //    \\| utc_offset             = +01
-    //    \\| utc_offset_DST         = +02
-    //    \\| time_zone_DST          = [[Central European Summer Time|CEST]]
-    //    \\| date_format            = dd/mm/yyyy
-    //    \\| drives_on              = right<ref name="DRIVESIDE">{{cite web |url=http://whatsideofroad.com/ad/ |title=What side of the road do they drive on in Andorra |access-date=19 March 2019 }}{{Dead link|date=September 2019 |bot=InternetArchiveBot |fix-attempted=yes }}</ref>
-    //    \\| calling_code           = [[Telephone numbers in Andorra|+376]]
-    //    \\| cctld                  = [[.ad]]{{efn|Also [[.cat]], shared with [[Països Catalans|Catalan-speaking territories]].}}
-    //    \\| today                  =
-    //    \\}}
-    //;
+    const arg_names = [_][]const u8{ "conventional_long_name", "common_name", "native_name", "image_flag", "image_coat", "symbol_type", "national_motto", "national_anthem", "image_map", "map_caption", "image_map2", "capital", "coordinates", "largest_city", "official_languages", "ethnic_groups", "ethnic_groups_year", "religion", "religion_year", "religion_ref", "demonym", "government_type", "leader_title1", "leader_name1", "leader_title2", "leader_name2", "leader_title3", "leader_name3", "leader_title4", "leader_name4", "legislature", "sovereignty_type", "established_event1", "established_date1", "established_event2", "established_date2", "established_event3", "established_date3", "area_km2", "area_rank", "area_sq_mi", "percent_water", "population_estimate", "population_estimate_rank", "population_estimate_year", "population_census_year", "population_density_km2", "population_density_sq_mi", "population_density_rank", "GDP_PPP", "GDP_PPP_year", "GDP_PPP_rank", "GDP_PPP_per_capita", "GDP_PPP_per_capita_rank", "GDP_nominal", "GDP_nominal_year", "GDP_nominal_rank", "GDP_nominal_per_capita", "GDP_nominal_per_capita_rank", "Gini", "Gini_year", "Gini_ref", "HDI", "HDI_year", "HDI_change", "HDI_ref", "HDI_rank", "currency", "currency_code", "time_zone", "utc_offset", "utc_offset_DST", "time_zone_DST", "date_format", "drives_on", "calling_code", "cctld", "today" };
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1775,16 +1859,17 @@ test "TEMPLATE large country infobox" {
     try std.testing.expect(wp.nodes.items.len == 1);
 
     switch (wp.nodes.items[0]) {
-        .template => |t| {
-            // arguments don't always parse correclty with current logic
-            //try std.testing.expectEqualStrings(
-            //    " conventional_long_name = Principality of Andorra<ref name="constitution">{{cite web|url=https://www.wipo.int/edocs/lexdocs/laws/en/ad/ad001en.pdf|title=Constitution of the Principality of Andorra|url-status=live|archive-url=https://web.archive.org/web/20190516152108/https://www.wipo.int/edocs/lexdocs/laws/en/ad/ad001en.pdf|archive-date=16 May 2019}}</ref>\n",
-            //    t.args.first.?.data,
-            //);
-            try std.testing.expectEqualStrings("Infobox country", t.name);
+        .template => |tmpl| {
+            try std.testing.expect(tmpl.args.len == arg_names.len);
+
+            var it = tmpl.args.first;
+            var i: usize = 0;
+            while (it) |node| {
+                try std.testing.expectEqualStrings(arg_names[i], node.data.name.?);
+                it = node.next;
+                i += 1;
+            }
         },
         else => unreachable,
     }
-
-    return error.SkipZigTest;
 }

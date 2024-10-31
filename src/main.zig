@@ -201,7 +201,7 @@ pub fn main() !void {
 ///
 /// `&gt;` to `>`
 ///
-/// `&amp;nbsp;` to `&nbsp;`
+/// `&amp;` to `&`
 ///
 /// delete `\r`
 fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
@@ -215,7 +215,7 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
     try sa.findAndReplace("&quot;", "\"");
     try sa.findAndReplace("&lt;", "<");
     try sa.findAndReplace("&gt;", ">");
-    try sa.findAndReplace("&amp;nbsp;", "&nbsp;");
+    try sa.findAndReplace("&amp;", "&");
     try sa.findAndReplace("\r", "");
 
     return try sa.toSlice();
