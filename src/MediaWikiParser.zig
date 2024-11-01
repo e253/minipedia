@@ -141,6 +141,12 @@ pub const MWParser = struct {
         IncompleteHtmlEntity,
         UnclosedHtmlComment,
         InvalidHtmlTag,
+        /// Separate from `InvalidHtmlTag` becuase math tags have different parsing
+        InvalidMathTag,
+        /// Separate from `InvalidHtmlTag` becuase nowiki tags have different parsing
+        InvalidNoWikiTag,
+        /// encountered closed html tag randomly. indicates invalid parsing earlier
+        SpuriousClosedHtmlTag,
         BadExternalLink,
         BadWikiLink,
         IncompleteTable,
@@ -215,7 +221,7 @@ pub const MWParser = struct {
 
                         cur_text_node = self.raw_wikitext[i..];
                         cur_text_node.len = 0;
-                    } else {
+                    } else if (nextEql(self.raw_wikitext, "[http", i)) {
                         if (cur_text_node.len > 0)
                             try self.nodes.append(.{ .text = cur_text_node });
 
@@ -227,6 +233,9 @@ pub const MWParser = struct {
 
                         cur_text_node = self.raw_wikitext[i..];
                         cur_text_node.len = 0;
+                    } else {
+                        i += 1;
+                        cur_text_node.len += 1;
                     }
                 },
 
@@ -359,16 +368,26 @@ pub const MWParser = struct {
             switch (self.raw_wikitext[i]) {
                 '=' => {
                     arg_name_end_opt = i;
-                    i += 1;
+                    i += "=".len;
+
+                    // doi links are raw text
+                    if (std.mem.eql(u8, "doi", self.raw_wikitext[arg_start..arg_name_end_opt.?])) {
+                        const doi_text_start = i;
+                        i = try skipUntilOneOf(self.raw_wikitext, &.{ ' ', '|', ']' }, i, FAIL);
+                        const doi_text = self.raw_wikitext[doi_text_start..i];
+                        arg.values.append(
+                            try newNode(self.a, ValueNode, .{ .text = doi_text }),
+                        );
+                        if (self.raw_wikitext[i] == ' ')
+                            i = try skipWhileOneOf(self.raw_wikitext, " \t\n", i, FAIL);
+                        const last = self.raw_wikitext[i] == ']';
+                        return .{ i + 1, arg, last };
+                    }
+
                     cur_text_node = self.raw_wikitext[i..];
                     cur_text_node.len = 0;
                 },
                 '<' => {
-                    if (cur_text_node.len > 0)
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                        );
-
                     if (nextEql(self.raw_wikitext, "!--", i + 1)) { // comment
                         i = try self.skipHtmlComment(i);
                     } else { // html tag
@@ -378,6 +397,10 @@ pub const MWParser = struct {
                         );
                     }
 
+                    if (cur_text_node.len > 0)
+                        arg.values.append(
+                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
+                        );
                     cur_text_node = self.raw_wikitext[i..];
                     cur_text_node.len = 0;
                 },
@@ -426,21 +449,30 @@ pub const MWParser = struct {
                     return .{ i + "|".len, arg, false };
                 },
                 '[' => { // link
-                    if (cur_text_node.len > 0)
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                        );
-
                     if (nextEql(self.raw_wikitext, "[[", i)) {
+                        if (cur_text_node.len > 0)
+                            arg.values.append(
+                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
+                            );
+
                         i, const wkl_ctx = try self.parseWikiLink(i);
                         arg.values.append(
                             try newNode(self.a, ValueNode, .{ .wiki_link = wkl_ctx }),
                         );
-                    } else {
+                    } else if (nextEql(self.raw_wikitext, "[[http", i)) {
+                        if (cur_text_node.len > 0)
+                            arg.values.append(
+                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
+                            );
+
                         i, const el_ctx = try self.parseExternalLink(i);
                         arg.values.append(
                             try newNode(self.a, ValueNode, .{ .external_link = el_ctx }),
                         );
+                    } else {
+                        i += 1;
+                        cur_text_node.len += 1;
+                        continue;
                     }
 
                     cur_text_node = self.raw_wikitext[i..];
@@ -632,21 +664,31 @@ pub const MWParser = struct {
                     return .{ i + "|".len, arg, false };
                 },
                 '[' => { // link
-                    if (cur_text_node.len > 0)
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                        );
 
                     if (nextEql(self.raw_wikitext, "[[", i)) {
+                        if (cur_text_node.len > 0)
+                            arg.values.append(
+                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
+                            );
+
                         i, const wkl_ctx = try self.parseWikiLink(i);
                         arg.values.append(
                             try newNode(self.a, ValueNode, .{ .wiki_link = wkl_ctx }),
                         );
-                    } else {
+                    } else if (nextEql(self.raw_wikitext, "[[http", i)) {
+                        if (cur_text_node.len > 0)
+                            arg.values.append(
+                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
+                            );
+
                         i, const el_ctx = try self.parseExternalLink(i);
                         arg.values.append(
                             try newNode(self.a, ValueNode, .{ .external_link = el_ctx }),
                         );
+                    } else {
+                        i += 1;
+                        cur_text_node.len += 1;
+                        continue;
                     }
 
                     cur_text_node = self.raw_wikitext[i..];
@@ -694,19 +736,15 @@ pub const MWParser = struct {
         return .{ i + 1, .{ .url = url, .title = name } };
     }
 
-    /// **Internal WIP**
-    ///
     /// `i` should point to the opening `<`
-    ///
-    /// TODO: handle nesting
-    ///
-    /// TODO: handle wrapped templates
     fn parseHtmlTag(self: *Self, start: usize) ParseError!struct { usize, HtmlTagCtx } {
         const FAIL = ParseError.InvalidHtmlTag;
 
         var i = try advance(start, "<".len, self.raw_wikitext, FAIL);
         if (isWhiteSpace(self.raw_wikitext[i]))
             return FAIL;
+        if (self.raw_wikitext[i] == '/')
+            return ParseError.SpuriousClosedHtmlTag;
 
         const tag_name_start = i;
         i = try skipUntilOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL);
@@ -781,20 +819,11 @@ pub const MWParser = struct {
             i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
         }
 
-        if (i + 1 >= self.raw_wikitext.len)
-            return FAIL;
-
         // Handle self closing tag
         if (self.raw_wikitext[i] == '/') {
-            if (self.raw_wikitext[i + 1] != '>')
-                return FAIL;
-            return .{
-                i + "/>".len,
-                .{
-                    .tag_name = tag_name,
-                    .attrs = attrs,
-                },
-            };
+            if (i + 1 < self.raw_wikitext.len and self.raw_wikitext[i + 1] == '>')
+                return .{ i + "/>".len, .{ .tag_name = tag_name, .attrs = attrs } };
+            return FAIL;
         }
 
         // skip closing '>'
@@ -802,7 +831,49 @@ pub const MWParser = struct {
             return FAIL;
         i += ">".len;
 
+        if (forbiddenClosingTag(tag_name))
+            return .{ i, .{ .tag_name = tag_name, .attrs = attrs } };
+
         var children = HtmlTagCtx.ChildList{};
+
+        // math tags are special and everything is fair game until </math>
+        // nowiki means discard all parsing, same effect
+        if (std.mem.eql(u8, tag_name, "math")) {
+            const latex_content_start = i;
+            while (i < self.raw_wikitext.len - "</math".len) : (i += 1) {
+                if (std.mem.eql(u8, self.raw_wikitext[i .. i + "</math".len], "</math")) {
+                    const latex_content = self.raw_wikitext[latex_content_start..i];
+                    children.append(
+                        try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = latex_content }),
+                    );
+
+                    i += "</math".len;
+                    i = try skipWhileOneOf(self.raw_wikitext, " \t\n", i, ParseError.InvalidMathTag);
+                    if (self.raw_wikitext[i] != '>')
+                        return ParseError.InvalidMathTag;
+
+                    return .{ i + ">".len, .{ .tag_name = tag_name, .attrs = attrs, .children = children } };
+                }
+            }
+        }
+        if (std.mem.eql(u8, tag_name, "nowiki")) {
+            const escaped_content_start = i;
+            while (i < self.raw_wikitext.len - "</nowiki".len) : (i += 1) {
+                if (std.mem.eql(u8, self.raw_wikitext[i .. i + "</nowiki".len], "</nowiki")) {
+                    const escaped_content = self.raw_wikitext[escaped_content_start..i];
+                    children.append(
+                        try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = escaped_content }),
+                    );
+
+                    i += "</nowiki".len;
+                    i = try skipWhileOneOf(self.raw_wikitext, " \t\n", i, ParseError.InvalidMathTag);
+                    if (self.raw_wikitext[i] != '>')
+                        return ParseError.InvalidMathTag;
+
+                    return .{ i + ">".len, .{ .tag_name = tag_name, .attrs = attrs, .children = children } };
+                }
+            }
+        }
 
         var cur_text_node = self.raw_wikitext[i..];
         cur_text_node.len = 0;
@@ -889,15 +960,9 @@ pub const MWParser = struct {
         const FAIL = ParseError.UnclosedHtmlComment;
 
         var i = start + "<!--".len;
-        while (i < self.raw_wikitext.len) : (i += 1) {
-            const ch = self.raw_wikitext[i];
-            if (ch == '-') {
-                if (nextEql(self.raw_wikitext, "-->", i)) {
-                    return i + "-->".len;
-                } else if (nextEql(self.raw_wikitext, "--", i)) {
-                    return FAIL;
-                }
-            }
+        while (i <= self.raw_wikitext.len - "-->".len) : (i += 1) {
+            if (std.mem.eql(u8, self.raw_wikitext[i .. i + "-->".len], "-->"))
+                return i + "-->".len;
         }
 
         return FAIL;
@@ -975,20 +1040,22 @@ pub const MWParser = struct {
             const ch = self.raw_wikitext[i];
             switch (ch) {
                 '<' => { // skip html tag
-                    i, _ = try self.parseHtmlTag(i);
+                    if (nextEql(self.raw_wikitext, "<!--", i)) {
+                        i = try self.skipHtmlComment(i);
+                    } else {
+                        i, _ = try self.parseHtmlTag(i);
+                    }
                 },
                 '=' => { // end of heading
                     const text = std.mem.trimRight(u8, self.raw_wikitext[text_start..i], &.{ ' ', '\t' });
+                    if (text.len == 0)
+                        return FAIL;
 
                     if (!nextEqlCount(self.raw_wikitext, '=', level, i))
                         return FAIL;
 
-                    i = try advance(i, level, self.raw_wikitext, FAIL);
-                    if (self.raw_wikitext[i] != '\n')
-                        return FAIL;
-
                     try self.nodes.append(.{ .heading = .{ .heading = text, .level = level } });
-                    return i;
+                    return i + level * "=".len;
                 },
                 '\n' => return FAIL,
                 else => i += 1,
@@ -1090,6 +1157,20 @@ inline fn isWhiteSpace(ch: u8) bool {
 /// true if `ch` is a printable ascii digit dec 48 <--> 57
 inline fn isDigit(ch: u8) bool {
     return 48 <= ch and ch <= 57;
+}
+
+/// Must this tag be self closed?
+///
+/// Also checks if it supports `<tag_name>` syntax in addition to `<tag_name/>`
+inline fn forbiddenClosingTag(tag_name: []const u8) bool {
+    const forbiddenClosingTagNames = [_][]const u8{ "area", "base", "basefont", "br", "col", "frame", "hr", "img", "input", "isindex", "link", "meta", "param" };
+
+    for (forbiddenClosingTagNames) |fctn| {
+        if (std.mem.eql(u8, fctn, tag_name))
+            return true;
+    }
+
+    return false;
 }
 
 /// returns `E` if `ch` is `\n`
@@ -1223,10 +1304,11 @@ test "HEADING rejects malformed headings" {
         \\== Anarchism=
         \\
     ;
-    const overclosed: []const u8 =
-        \\== Anarchism===
-        \\
-    ;
+    // not considered an error anymore
+    //const overclosed: []const u8 =
+    //    \\== Anarchism===
+    //    \\
+    //;
     const bad_line_break: []const u8 =
         \\== Anarchism
         \\==
@@ -1236,7 +1318,7 @@ test "HEADING rejects malformed headings" {
         \\= = =
         \\
     ;
-    const cases = [_][]const u8{ unclosed1, unclosed2, overclosed, bad_line_break, weird };
+    const cases = [_][]const u8{ unclosed1, unclosed2, bad_line_break, weird };
 
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1314,6 +1396,47 @@ test "HEADING embedded html with attributes" {
     }
 }
 
+test "HEADING parses correctly with following html comment" {
+    const wikitext = "===Molecular geometry===<!-- This section is linked from [[Nylon]] -->";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+    switch (wp.nodes.items[0]) {
+        .heading => |h| {
+            try std.testing.expect(h.level == 3);
+            try std.testing.expectEqualStrings("Molecular geometry", h.heading);
+        },
+        else => unreachable,
+    }
+}
+
+// TODO: The comment should be skipped, for now it goes into the heading text
+test "HEADING parses correctly with inline html comment" {
+    const wikitext = "==Scientific viewpoints<!--linked from 'Evolution of morality'-->==";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+    switch (wp.nodes.items[0]) {
+        .heading => |h| {
+            try std.testing.expect(h.level == 2);
+            try std.testing.expectEqualStrings("Scientific viewpoints<!--linked from 'Evolution of morality'-->", h.heading);
+        },
+        else => unreachable,
+    }
+}
+
 test "Rejects various malformed html entities" {
     const non_numerical_num: []const u8 = "&#hello;";
     const too_many_digits: []const u8 = "&#12345;";
@@ -1356,7 +1479,7 @@ test "Correctly Parses HTML Entity" {
     }
 }
 
-test "Errors on unclosed html comment" {
+test "COMMENT fails on unclosed" {
     const wikitext = "<!-- Blah --";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1369,7 +1492,7 @@ test "Errors on unclosed html comment" {
     try std.testing.expectError(MWParser.ParseError.UnclosedHtmlComment, e);
 }
 
-test "Skips HTML Comment" {
+test "COMMENT correct" {
     const wikitext = "<!-- Blah Blah -->";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1382,7 +1505,22 @@ test "Skips HTML Comment" {
     try std.testing.expect(wp.nodes.items.len == 0);
 }
 
-test "Parses Well Formed Heading With Some Text and a Comment" {
+test "COMMENT skips enclosed '-' and embedded tags" {
+    const wikitext =
+        \\<!--In aquatic amphibians, the liver plays only a small role in processing nitrogen for excretion, and [[ammonia]] is diffused mainly through the skin. The liver of terrestrial amphibians converts ammonia to urea, a less toxic, water-soluble nitrogenous compound, as a means of water conservation. In some species, urea is further converted into [[uric acid]]. [[Bile]] secretions from the liver collect in the gall bladder and flow into the small intestine. In the small intestine, enzymes digest carbohydrates, fats, and proteins. Salamanders lack a valve separating the small intestine from the large intestine. Salt and water absorption occur in the large intestine, as well as mucous secretion to aid in the transport of faecal matter, which is passed out through the [[cloaca]].<ref name="Anatomy" />---Omitting this until a more reliable source can be found.--->
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 0);
+}
+
+test "HEADING COMMENT well formed heading with some text and a comment" {
     const wikitext =
         \\= Blah Blah Blah =
         \\Blah <!-- Blah Blah --> Blah Blah
@@ -1631,16 +1769,109 @@ test "HTML_TAG decodes wrapped template" {
     try wp.parse();
 }
 
-// TODO: Html Tag parsing failure is a separate error ... fails over to treating the <> as text
-test "HTML_TAG nested <> in template" {
+test "HTML_TAG <math> ignores '{' and '}'" {
     const wikitext =
-        \\<ref name="Winston">{{cite journal| first=Jay |last=Winston |title=The Annual Course of Zonal Mean Albedo as Derived From ESSA 3 and 5 Digitized Picture Data |journal=Monthly Weather Review |volume=99 |pages=818–827| bibcode=1971MWRv...99..818W| date=1971| doi=10.1175/1520-0493(1971)099<0818:TACOZM>2.3.CO;2| issue=11|doi-access=free}}</ref>"
+        \\<math display="block">F = \frac{MS_\text{Treatments}}{MS_\text{Error}} = {{SS_\text{Treatments} / (I-1)} \over {SS_\text{Error} / (n_T-I)}}</math
+        \\>
     ;
-    _ = wikitext;
-    return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    switch (wp.nodes.items[0]) {
+        .html_tag => |ht| {
+            const c1 = ht.children.first.?.data;
+            switch (c1) {
+                .text => |txt| try std.testing.expectEqualStrings(
+                    \\F = \frac{MS_\text{Treatments}}{MS_\text{Error}} = {{SS_\text{Treatments} / (I-1)} \over {SS_\text{Error} / (n_T-I)}}
+                , txt),
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
 }
 
-test "External Link No Title" {
+test "HTML_TAG <math> ignores '<'" {
+    const wikitext =
+        \\<math>\hat{\sigma}_\text{OC} < 0.1</math>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    switch (wp.nodes.items[0]) {
+        .html_tag => |ht| {
+            const c1 = ht.children.first.?.data;
+            switch (c1) {
+                .text => |txt| try std.testing.expectEqualStrings(
+                    \\\hat{\sigma}_\text{OC} < 0.1
+                , txt),
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+test "HTML_TAG nowiki is respected" {
+    const wikitext =
+        \\<nowiki> "#$%&'()*+,-./0123456789:;<=>?</nowiki>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    switch (wp.nodes.items[0]) {
+        .html_tag => |ht| {
+            const c1 = ht.children.first.?.data;
+            switch (c1) {
+                .text => |txt| try std.testing.expectEqualStrings(
+                    \\ "#$%&'()*+,-./0123456789:;<=>?
+                , txt),
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+test "HTML_TAG br, hr must be self closed" {
+    const wikitextPass = "<br ><br /><br name='hi'><hr>";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitextPass);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 4);
+
+    switch (wp.nodes.items[2]) {
+        .html_tag => |ht| {
+            try std.testing.expect(ht.attrs.len == 1);
+            const a1 = ht.attrs.first.?.data;
+            try std.testing.expectEqualStrings("name", a1.name);
+            try std.testing.expectEqualStrings("hi", a1.value);
+        },
+        else => unreachable,
+    }
+}
+
+test "EXTERNAL_LINK no title" {
     const wikitext = "[https://example.com]";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1660,7 +1891,7 @@ test "External Link No Title" {
     }
 }
 
-test "External Link With Title" {
+test "EXTERNAL_LINK title" {
     const wikitext = "[http://dwardmac.pitzer.edu Anarchy Archives]";
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1990,7 +2221,11 @@ test "TEMPLATE html comment ends KV arg" {
             switch (value2.data) {
                 .wiki_link => |wl_ctx| {
                     try std.testing.expectEqualStrings("Northern flicker", wl_ctx.article);
-                    //try std.testing.expectEqualStrings("Yellowhammer", wl_ctx.name.?);
+                    try std.testing.expect(wl_ctx.args.len == 1);
+                    switch (wl_ctx.args.first.?.data.values.first.?.data) {
+                        .text => |txt| try std.testing.expectEqualStrings("Yellowhammer", txt),
+                        else => unreachable,
+                    }
                 },
                 else => unreachable,
             }
@@ -1999,8 +2234,47 @@ test "TEMPLATE html comment ends KV arg" {
             switch (value4.data) {
                 .wiki_link => |wl_ctx| {
                     try std.testing.expectEqualStrings("wild turkey", wl_ctx.article);
-                    //try std.testing.expect(wl_ctx.name == null);
+                    try std.testing.expect(wl_ctx.args.len == 0);
                 },
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+test "TEMPLATE doi link is escaped from parsing" {
+    const wikitext =
+        \\<ref name="Winston">{{cite journal| first=Jay |last=Winston |title=The Annual Course of Zonal Mean Albedo as Derived From ESSA 3 and 5 Digitized Picture Data |journal=Monthly Weather Review |volume=99 |pages=818–827| bibcode=1971MWRv...99..818W| date=1971| doi=10.1175/1520-0493(1971)099<0818:TACOZM>2.3.CO;2| issue=11|doi-access=free}}</ref>"
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+}
+
+// TODO: grab html entity
+// trim text
+test "TEMPLATE '[' treated as text" {
+    const wikitext = "{{cite web |url=http://lcweb2.loc.gov/diglib/ihas/loc.natlib.ihas.100010615/full.html |title=Materna (O Mother Dear, Jerusalem) / Samuel Augustus Ward [hymnal&#93;: Print Material Full Description: Performing Arts Encyclopedia, Library of Congress |publisher=Lcweb2.loc.gov |date=2007-10-30 |access-date=2011-08-20 |url-status=live |archive-url=https://web.archive.org/web/20110605020952/http://lcweb2.loc.gov/diglib/ihas/loc.natlib.ihas.100010615/full.html |archive-date=June 5, 2011}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var wp = MWParser.init(a, wikitext);
+    try wp.parse();
+
+    try std.testing.expect(wp.nodes.items.len == 1);
+    switch (wp.nodes.items[0]) {
+        .template => |tmpl| {
+            const arg2 = tmpl.args.first.?.next.?.data;
+            const arg2Value1 = arg2.values.first.?.data;
+            switch (arg2Value1) {
+                .text => |txt| try std.testing.expectEqualStrings("Materna (O Mother Dear, Jerusalem) / Samuel Augustus Ward [hymnal&#93;: Print Material Full Description: Performing Arts Encyclopedia, Library of Congress ", txt),
                 else => unreachable,
             }
         },

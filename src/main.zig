@@ -203,6 +203,8 @@ pub fn main() !void {
 ///
 /// `&amp;` to `&`
 ///
+/// `&apos;` to `'`
+///
 /// delete `\r`
 fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
     var sa = SliceArray.init(a);
@@ -216,6 +218,7 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
     try sa.findAndReplace("&lt;", "<");
     try sa.findAndReplace("&gt;", ">");
     try sa.findAndReplace("&amp;", "&");
+    try sa.findAndReplace("&apos;", "'");
     try sa.findAndReplace("\r", "");
 
     return try sa.toSlice();
