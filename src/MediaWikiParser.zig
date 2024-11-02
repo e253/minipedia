@@ -58,7 +58,7 @@ pub const Template = struct {
 };
 
 pub const Argument = struct {
-    name: ?[]const u8,
+    name: ?[]const u8 = null,
 };
 
 pub const MWAstNode = struct {
@@ -118,9 +118,7 @@ pub const MWAstNode = struct {
 
     pub fn createChildNode(s: *Self, n: NodeData) error{OutOfMemory}!*MWAstNode {
         const new_node = try s.a.create(Self);
-        new_node.parent = s;
-        new_node.n = n;
-        new_node.a = s.a;
+        new_node.* = .{ .a = s.a, .parent = s, .n = n };
         return new_node;
     }
 
@@ -216,11 +214,7 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
                     // Template.
                     try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
 
-                    //i, const t_ctx = self.parseTemplate(i) catch |err| {
-                    //    std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
-                    //    return err;
-                    //};
-                    //try self.nodes.append(.{ .template = t_ctx });
+                    i = try parseTemplate(&doc, text, i);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -331,6 +325,165 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
 
 ///////////////////////////////////////////////////////////////////////
 // Node type specific parser functions.
+
+fn parseTemplate(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+    const FAIL = Error.BadTemplate;
+
+    var i = start + "{{".len;
+
+    // get template name
+    const template_name_start = i;
+    i = try skipUntilOneOf(text, &.{ '\n', '}', '|' }, i, FAIL);
+    const template_name = text[template_name_start..i];
+
+    // allocate node and link it
+    const template_node = try parent.createChildNode(.{ .template = .{ .name = template_name } });
+
+    // skip whitespace after template name
+    i = try skipWhileOneOf(text, &.{ ' ', '\t', '\n' }, i, FAIL);
+
+    // if template closes, return it
+    if (nextEql(text, "}}", i)) {
+        parent.appendChild(template_node);
+        return i + "}}".len;
+    }
+
+    if (text[i] != '|')
+        return FAIL;
+    i += "|".len;
+
+    // parse args
+    while (i < text.len) {
+        i, const last = try parseArgument(template_node, text, i);
+        if (last) {
+            parent.appendChild(template_node);
+            return i;
+        }
+    }
+
+    return FAIL;
+}
+
+/// Parses template / wikilink argument with start pointing to the first character
+fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize) Error!struct { usize, bool } {
+    std.debug.assert(parent.nodeType() == .wiki_link or parent.nodeType() == .template);
+    const FAIL = Error.BadTemplate;
+
+    var arg_node = try parent.createChildNode(.{ .argument = .{} });
+
+    var i = try skipWhileOneOf(text, " \t\n", start, FAIL);
+
+    const arg_start = i;
+
+    var cur_text_node = text[i..];
+    cur_text_node.len = 0;
+
+    while (i < text.len) {
+        switch (text[i]) {
+            '=' => {
+                const arg_name = std.mem.trimRight(u8, text[arg_start..i], " \t\n");
+                arg_node.*.n = .{ .argument = .{ .name = arg_name } };
+
+                i += "=".len;
+
+                // DOI links are raw text in templates.
+                if (parent.nodeType() == .wiki_link and std.mem.eql(u8, "doi", arg_name)) {
+                    const doi_text_start = i;
+                    i = try skipUntilOneOf(text, &.{ ' ', '|', '}' }, i, FAIL);
+                    const doi_text_node = try parent.createChildNode(.{ .text = text[doi_text_start..i] });
+                    arg_node.appendChild(doi_text_node);
+                    if (text[i] == ' ')
+                        i = try skipWhileOneOf(text, " \t\n", i, FAIL);
+                    const last = nextEql(text, "}}", i);
+                    return .{ i + "}}".len, last };
+                }
+
+                cur_text_node = text[i..];
+                cur_text_node.len = 0;
+            },
+            '<' => {
+                try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+
+                if (nextEql(text, "!--", i + 1)) {
+                    // Comment.
+                    i = try skipHtmlComment(text, i);
+                } else {
+                    // Html tag.
+
+                    //i, const ht_ctx = try self.parseHtmlTag(i);
+                    //arg.values.append(
+                    //    try newNode(self.a, ValueNode, .{ .html_tag = ht_ctx }),
+                    //);
+                }
+
+                cur_text_node = text[i..];
+                cur_text_node.len = 0;
+            },
+            '}' => {
+                if (nextEql(text, "}}", i)) {
+                    // Done. this is the last argument
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+                    parent.appendChild(arg_node);
+                    return .{ i + "}}".len, true };
+                } else {
+                    // Continue with } as text.
+                    i += 1;
+                    cur_text_node.len += 1;
+                }
+            },
+            '{' => {
+                if (nextEql(text, "{{", i)) {
+                    // Nested tag.
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+
+                    i = try parseTemplate(arg_node, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else {
+                    // Continue with { as text.
+                    i += 1;
+                    cur_text_node.len += 1;
+                }
+            },
+            '|' => {
+                // Done!
+                try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+                parent.appendChild(arg_node);
+                return .{ i + "|".len, false };
+            },
+            '[' => {
+                // Link.
+                if (nextEql(text, "[[", i)) {
+                    // Wikilink.
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+
+                    //i, const wkl_ctx = try self.parseWikiLink(i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else if (nextEql(text, "[[http", i)) {
+                    // External link.
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+
+                    i = try parseExternalLink(arg_node, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else {
+                    i += 1;
+                    cur_text_node.len += 1;
+                }
+            },
+            else => {
+                i += 1;
+                cur_text_node.len += 1;
+            },
+        }
+    }
+
+    return FAIL;
+}
 
 fn parseExternalLink(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
     const FAIL = Error.BadExternalLink;
@@ -672,6 +825,133 @@ test "EXTERNAL_LINK title" {
         .external_link => |el| {
             try std.testing.expectEqualStrings("http://dwardmac.pitzer.edu", el.url);
             try std.testing.expectEqualStrings("Anarchy Archives", el.title.?);
+        },
+        else => unreachable,
+    }
+}
+
+test "TEMPLATE no args" {
+    const wikitext = "{{Anarchism sidebar}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const t_node = doc.first_child.?;
+    try std.testing.expect(t_node.n_children == 0);
+    switch (t_node.n) {
+        .template => |t| {
+            try std.testing.expectEqualStrings("Anarchism sidebar", t.name);
+        },
+        else => unreachable,
+    }
+}
+
+test "TEMPLATE text argument no name" {
+    const wikitext = "{{Main|Definition of anarchism and libertarianism}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const t_node = doc.first_child.?;
+    try std.testing.expect(t_node.n_children == 1);
+
+    switch (t_node.n) {
+        .template => |temp| {
+            try std.testing.expectEqualStrings("Main", temp.name);
+            const arg_node = t_node.first_child.?;
+            switch (arg_node.n) {
+                .argument => |arg| {
+                    try std.testing.expect(arg.name == null);
+
+                    const text_node = arg_node.first_child.?;
+                    switch (text_node.n) {
+                        .text => |txt| try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", txt),
+                        else => unreachable,
+                    }
+                },
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+test "TEMPLATE child as arg" {
+    const wikitext = "{{Main|{{Definition of anarchism and libertarianism}}}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const t_node = doc.first_child.?;
+    try std.testing.expect(t_node.n_children == 1);
+
+    switch (t_node.n) {
+        .template => |temp| {
+            try std.testing.expectEqualStrings("Main", temp.name);
+            const arg_node = t_node.first_child.?;
+            switch (arg_node.n) {
+                .argument => |arg| {
+                    try std.testing.expect(arg.name == null);
+
+                    const arg_t_node = arg_node.first_child.?;
+                    switch (arg_t_node.n) {
+                        .template => |temp2| try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", temp2.name),
+                        else => unreachable,
+                    }
+                },
+                else => unreachable,
+            }
+        },
+        else => unreachable,
+    }
+}
+
+test "TEMPLATE parses with KV arg" {
+    const wikitext = "{{Main|date=May 2023}}";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const t_node = doc.first_child.?;
+    try std.testing.expect(t_node.n_children == 1);
+
+    switch (t_node.n) {
+        .template => |t| {
+            try std.testing.expectEqualStrings("Main", t.name);
+
+            const arg_node = t_node.first_child.?;
+            switch (arg_node.n) {
+                .argument => |arg| {
+                    try std.testing.expectEqualStrings("date", arg.name.?);
+
+                    const text_node = arg_node.first_child.?;
+                    switch (text_node.n) {
+                        .text => |txt| try std.testing.expectEqualStrings("May 2023", txt),
+                        else => unreachable,
+                    }
+                },
+                else => unreachable,
+            }
         },
         else => unreachable,
     }
