@@ -1,55 +1,16 @@
 const std = @import("std");
-const std_options = .{ .log_level = .debug };
 
-pub const MWNodeType = enum {
-    template, // {{}}
-    wiki_link, // [[]]
-    external_link, // [https://example.com Example] or [https://example.com]
-    heading, // like == References ==
-    html_tag, // <ref> or other html tags
-    html_entity, // i.e. &qout;
-    argument, // {{{arg}}} I don't know what this does
-    text,
-    table, // {|\n ... |}.
-};
-
-pub const MWNode = union(MWNodeType) {
-    template: TemplateCtx,
-    wiki_link: WikiLinkCtx,
-    external_link: ExternalLinkCtx,
-    heading: HeadingCtx,
-    html_tag: HtmlTagCtx,
-    html_entity: []const u8,
-    argument: []const u8,
-    text: []const u8,
-    table: []const u8,
-};
-
-pub const ExternalLinkCtx = struct {
+pub const ExternalLink = struct {
     url: []const u8,
     title: ?[]const u8 = null,
 };
 
-pub const WikiLinkCtx = struct {
-    pub const WLArg = struct {
-        pub const ValueList = std.DoublyLinkedList(MWNode);
-        pub const ValueNode = ValueList.Node;
-
-        name: ?[]const u8 = null,
-        values: ValueList = ValueList{},
-    };
-
-    pub const WLArgList = std.DoublyLinkedList(WLArg);
-    pub const WLArgNode = WLArgList.Node;
-
+pub const WikiLink = struct {
     pub const Namepace = enum(u8) {
-        /// For unknown
         Unknown,
-        /// Regular Articles
         Main,
-        /// Images and audio files
         File,
-        /// Link to Wikitionary
+        Image,
         Wikitionary,
 
         pub fn fromStr(str: []const u8) Namepace {
@@ -59,6 +20,8 @@ pub const WikiLinkCtx = struct {
                 return .File;
             } else if (std.mem.eql(u8, str, "wikt")) {
                 return .Wikitionary;
+            } else if (std.mem.eql(u8, str, "Image")) {
+                return .Image;
             } else {
                 return .Unknown;
             }
@@ -67,1051 +30,999 @@ pub const WikiLinkCtx = struct {
 
     /// Actual article to link to
     article: []const u8,
-    /// `[[article|<arg>|<arg>]]`
-    args: WLArgList = WLArgList{},
-    /// File extension if it exists
+    /// File extension if it exists (always null for now)
     ext: ?[]const u8 = null,
+    /// link namespce, not included in `article`
     namespace: Namepace = Namepace.Main,
 };
 
-pub const HeadingCtx = struct {
-    heading: []const u8,
+pub const Heading = struct {
     level: usize,
 };
 
-pub const HtmlTagCtx = struct {
+pub const HtmlTag = struct {
     pub const HtmlTagAttr = struct {
         name: []const u8,
         value: []const u8,
     };
     pub const AttrList = std.DoublyLinkedList(HtmlTagAttr);
     pub const AttrNode = AttrList.Node;
-    pub const ChildList = std.DoublyLinkedList(MWNode);
-    pub const ChildNode = ChildList.Node;
 
-    tag_name: []const u8,
+    tag_name: []const u8 = "",
     attrs: AttrList = AttrList{},
-    /// Nodes in between \<tag\> and \</tag\>, including text
-    children: ChildList = ChildList{},
 };
 
-pub const TemplateCtx = struct {
-    pub const Arg = struct {
-        pub const ValueList = std.DoublyLinkedList(MWNode);
-        pub const ValueNode = ValueList.Node;
+pub const Template = struct {
+    name: []const u8,
+};
 
-        name: ?[]const u8 = null,
-        values: ValueList = ValueList{},
+pub const Argument = struct {
+    key: ?[]const u8 = null,
+};
+
+pub const MWAstNode = struct {
+    const Self = @This();
+    pub const NodeType = enum {
+        /// {{}}
+        template,
+        /// [[]]
+        wiki_link,
+        /// [https://example.com Example] or [https://example.com]
+        external_link,
+        /// like == References ==
+        heading,
+        /// <ref> or other html tags
+        html_tag,
+        /// i.e. &qout;
+        html_entity,
+        /// {{{arg}}} I don't know what this does
+        argument,
+        text,
+        /// {|\n ... |}.
+        table,
+        /// no data, parent, or siblings, just children
+        document,
+    };
+    pub const NodeData = union(NodeType) {
+        template: Template,
+        wiki_link: WikiLink,
+        external_link: ExternalLink,
+        heading: Heading,
+        html_tag: HtmlTag,
+        html_entity: []const u8,
+        argument: Argument,
+        text: []const u8,
+        table: []const u8,
+        document: ?void,
     };
 
-    pub const ArgList = std.DoublyLinkedList(Arg);
-    pub const ArgNode = ArgList.Node;
-
-    name: []const u8,
-    args: std.DoublyLinkedList(Arg) = ArgList{},
-};
-
-/// Allocates one `N` struct and copies `data` to `N.data`
-fn newNode(a: std.mem.Allocator, N: type, data: anytype) !*N {
-    const n = try a.create(N);
-    n.*.data = data;
-    return n;
-}
-
-pub const MWParser = struct {
-    /// Contains list of nodes which will eventually contain parsed information
-    nodes: std.ArrayList(MWNode),
-    raw_wikitext: []const u8,
-    /// This must be arena, ideally wrapping a fixed buffer allocator
     a: std.mem.Allocator,
 
-    const Self = @This();
+    parent: ?*MWAstNode = null,
+    /// previous adjacent node
+    prev: ?*MWAstNode = null,
+    /// next adjacent node
+    next: ?*MWAstNode = null,
+    /// first child node
+    first_child: ?*MWAstNode = null,
+    /// last child node
+    last_child: ?*MWAstNode = null,
+    /// number of children
+    n_children: usize = 0,
+    n: NodeData = .{ .document = null },
 
-    pub fn init(a: std.mem.Allocator, wikitext: []const u8) Self {
-        return .{
-            .nodes = std.ArrayList(MWNode).init(a),
-            .raw_wikitext = wikitext,
-            .a = a,
-        };
+    pub fn nodeType(s: Self) NodeType {
+        return s.n;
     }
 
-    pub const ParseError = error{
-        IncompleteArgument,
-        IncompleteHeading,
-        IncompleteHtmlEntity,
-        UnclosedHtmlComment,
-        InvalidHtmlTag,
-        /// Separate from `InvalidHtmlTag` becuase math tags have different parsing
-        InvalidMathTag,
-        /// Separate from `InvalidHtmlTag` becuase nowiki tags have different parsing
-        InvalidNoWikiTag,
-        /// encountered closed html tag randomly. indicates invalid parsing earlier
-        SpuriousClosedHtmlTag,
-        BadExternalLink,
-        BadWikiLink,
-        IncompleteTable,
-        BadTemplate,
-
-        // So this can a global set for MWParser functions
-        OutOfMemory,
-    };
-
-    /// iterates through characters and dispatches to node specific parsing functions
-    ///
-    /// HTML entities `&lt;` and `&gt;` must be replaced with `<` and `>` to be interpreted as html tags.
-    ///
-    /// anything starting with `&` is assumed to be an HTML entity. Use `&amp;` instead.
-    ///
-    /// All carriage returns, '\r', will be interpreted as text. Remove them before using.
-    pub fn parse(self: *Self) !void {
-        var i: usize = 0;
-        var cur_text_node = self.raw_wikitext;
-        cur_text_node.len = 0;
-        while (i < self.raw_wikitext.len) {
-            const ch = self.raw_wikitext[i];
-            switch (ch) {
-                // could be a tag or an argument or just text
-                '{' => {
-                    if (nextEql(self.raw_wikitext, "{{{", i)) {
-                        if (cur_text_node.len > 0)
-                            try self.nodes.append(.{ .text = cur_text_node });
-
-                        i = try self.parseArgument(i);
-
-                        cur_text_node = self.raw_wikitext[i..];
-                        cur_text_node.len = 0;
-                    } else if (nextEql(self.raw_wikitext, "{{", i)) {
-                        if (cur_text_node.len > 0)
-                            try self.nodes.append(.{ .text = cur_text_node });
-
-                        i, const t_ctx = self.parseTemplate(i) catch |err| {
-                            std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
-                            return err;
-                        };
-
-                        try self.nodes.append(.{ .template = t_ctx });
-
-                        cur_text_node = self.raw_wikitext[i..];
-                        cur_text_node.len = 0;
-                    } else if (nextEql(self.raw_wikitext, "{|", i)) {
-                        if (cur_text_node.len > 0)
-                            try self.nodes.append(.{ .text = cur_text_node });
-
-                        i = try self.parseTable(i);
-
-                        cur_text_node = self.raw_wikitext[i..];
-                        cur_text_node.len = 0;
-                    } else {
-                        cur_text_node.len += 1;
-                        i += 1;
-                    }
-                },
-
-                // wikilink or external link
-                '[' => {
-                    if (nextEql(self.raw_wikitext, "[[", i)) {
-                        if (cur_text_node.len > 0)
-                            try self.nodes.append(.{ .text = cur_text_node });
-
-                        i, const wkl_ctx = self.parseWikiLink(i) catch |err| {
-                            std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
-                            return err;
-                        };
-                        try self.nodes.append(.{ .wiki_link = wkl_ctx });
-
-                        cur_text_node = self.raw_wikitext[i..];
-                        cur_text_node.len = 0;
-                    } else if (nextEql(self.raw_wikitext, "[http", i)) {
-                        if (cur_text_node.len > 0)
-                            try self.nodes.append(.{ .text = cur_text_node });
-
-                        i, const el_ctx = self.parseExternalLink(i) catch |err| {
-                            std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
-                            return err;
-                        };
-                        try self.nodes.append(.{ .external_link = el_ctx });
-
-                        cur_text_node = self.raw_wikitext[i..];
-                        cur_text_node.len = 0;
-                    } else {
-                        i += 1;
-                        cur_text_node.len += 1;
-                    }
-                },
-
-                '<' => {
-                    if (cur_text_node.len > 0)
-                        try self.nodes.append(.{ .text = cur_text_node });
-
-                    if (nextEql(self.raw_wikitext, "!--", i + 1)) {
-                        i = self.skipHtmlComment(i) catch |err| {
-                            std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
-                            return err;
-                        };
-                    } else {
-                        i, const ht_ctx = self.parseHtmlTag(i) catch |err| {
-                            std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
-                            return err;
-                        };
-                        try self.nodes.append(.{ .html_tag = ht_ctx });
-                    }
-
-                    cur_text_node = self.raw_wikitext[i..];
-                    cur_text_node.len = 0;
-                },
-
-                // html entity
-                '&' => {
-                    if (cur_text_node.len > 0)
-                        try self.nodes.append(.{ .text = cur_text_node });
-
-                    i = try self.parseHtmlEntity(i);
-
-                    cur_text_node = self.raw_wikitext[i..];
-                    cur_text_node.len = 0;
-                },
-
-                // headings
-                '=' => {
-                    // article or line start with an equals is expected to be a heading
-                    if (i == 0 or (i > 0 and self.raw_wikitext[i - 1] == '\n')) {
-                        if (cur_text_node.len > 0)
-                            try self.nodes.append(.{ .text = cur_text_node });
-
-                        i = self.parseHeading(i) catch |err| {
-                            std.log.debug("{s} Context: '{s}'", .{ @errorName(err), getErrContext(self.raw_wikitext, i) });
-                            return err;
-                        };
-
-                        cur_text_node = self.raw_wikitext[i..];
-                        cur_text_node.len = 0;
-                    } else {
-                        cur_text_node.len += 1;
-                        i += 1;
-                    }
-                },
-
-                // continue adding to text node
-                else => {
-                    cur_text_node.len += 1;
-                    i += 1;
-                },
-            }
-        }
-
-        if (cur_text_node.len > 0)
-            try self.nodes.append(.{ .text = cur_text_node });
+    pub fn nodeTypeStr(s: Self) []const u8 {
+        return @tagName(s.n);
     }
 
-    fn parseTemplate(self: *Self, start: usize) ParseError!struct { usize, TemplateCtx } {
-        const FAIL = ParseError.BadTemplate;
-
-        var i = start + "{{".len;
-
-        // get template name
-        const template_name_start = i;
-        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', '}', '|' }, i, FAIL);
-        const template_name = self.raw_wikitext[template_name_start..i];
-
-        // skip whitespace after template name
-        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
-
-        // if template closes, return it
-        if (nextEql(self.raw_wikitext, "}}", i)) {
-            return .{
-                i + "}}".len,
-                .{ .name = template_name },
-            };
-        }
-
-        if (self.raw_wikitext[i] != '|')
-            return FAIL;
-        i += "|".len;
-
-        // parse args
-        var arg_list = TemplateCtx.ArgList{};
-        const ArgNode = TemplateCtx.ArgNode;
-
-        while (i < self.raw_wikitext.len) {
-            i, const arg, const last = try self.parseTemplateArgument(i);
-            arg_list.append(
-                try newNode(self.a, ArgNode, arg),
-            );
-
-            if (last) {
-                return .{ i, .{
-                    .name = template_name,
-                    .args = arg_list,
-                } };
+    pub fn getArgByKey(s: *const Self, key: []const u8) !?*MWAstNode {
+        var it = s.first_child;
+        while (it) |node| : (it = node.next) {
+            switch (node.n) {
+                .argument => |arg| {
+                    if (arg.key) |_key| {
+                        if (std.mem.eql(u8, key, _key))
+                            return node;
+                    }
+                },
+                else => return Error.InvalidDataCast,
             }
         }
-
-        return FAIL;
+        return null;
     }
 
-    /// Parses template argument with start pointing to the first character
-    fn parseTemplateArgument(self: *Self, start: usize) ParseError!struct { usize, TemplateCtx.Arg, bool } {
-        const FAIL = ParseError.BadTemplate;
-        const ValueNode = TemplateCtx.Arg.ValueNode;
-
-        var arg = TemplateCtx.Arg{};
-
-        var i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, start, FAIL);
-
-        const arg_start = i;
-        var arg_name_end_opt: ?usize = null;
-
-        var cur_text_node = self.raw_wikitext[i..];
-        cur_text_node.len = 0;
-
-        while (i < self.raw_wikitext.len) {
-            switch (self.raw_wikitext[i]) {
-                '=' => {
-                    arg_name_end_opt = i;
-                    i += "=".len;
-
-                    // doi links are raw text
-                    if (std.mem.eql(u8, "doi", self.raw_wikitext[arg_start..arg_name_end_opt.?])) {
-                        const doi_text_start = i;
-                        i = try skipUntilOneOf(self.raw_wikitext, &.{ ' ', '|', ']' }, i, FAIL);
-                        const doi_text = self.raw_wikitext[doi_text_start..i];
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .text = doi_text }),
-                        );
-                        if (self.raw_wikitext[i] == ' ')
-                            i = try skipWhileOneOf(self.raw_wikitext, " \t\n", i, FAIL);
-                        const last = self.raw_wikitext[i] == ']';
-                        return .{ i + 1, arg, last };
-                    }
-
-                    cur_text_node = self.raw_wikitext[i..];
-                    cur_text_node.len = 0;
-                },
-                '<' => {
-                    if (nextEql(self.raw_wikitext, "!--", i + 1)) { // comment
-                        i = try self.skipHtmlComment(i);
-                    } else { // html tag
-                        i, const ht_ctx = try self.parseHtmlTag(i);
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .html_tag = ht_ctx }),
-                        );
-                    }
-
-                    if (cur_text_node.len > 0)
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                        );
-                    cur_text_node = self.raw_wikitext[i..];
-                    cur_text_node.len = 0;
-                },
-                '}' => {
-                    if (nextEql(self.raw_wikitext, "}}", i)) { // done!
-                        if (cur_text_node.len > 0)
-                            arg.values.append(
-                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                            );
-                        if (arg_name_end_opt) |arg_name_end|
-                            arg.name = std.mem.trimRight(u8, self.raw_wikitext[arg_start..arg_name_end], &.{ ' ', '\t', '\n' });
-                        return .{ i + "}}".len, arg, true };
-                    } else { // continue with } as text
-                        i += 1;
-                        cur_text_node.len += 1;
-                    }
-                },
-                '{' => {
-                    if (nextEql(self.raw_wikitext, "{{", i)) { // nested tag
-
-                        if (cur_text_node.len > 0)
-                            arg.values.append(
-                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                            );
-
-                        i, const t_ctx = try self.parseTemplate(i);
-
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .template = t_ctx }),
-                        );
-
-                        cur_text_node = self.raw_wikitext[i..];
-                        cur_text_node.len = 0;
-                    } else { // continue with { as text
-                        i += 1;
-                        cur_text_node.len += 1;
-                    }
-                },
-                '|' => { // done!
-                    if (cur_text_node.len > 0)
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                        );
-                    if (arg_name_end_opt) |arg_name_end|
-                        arg.name = std.mem.trimRight(u8, self.raw_wikitext[arg_start..arg_name_end], &.{ ' ', '\t', '\n' });
-                    return .{ i + "|".len, arg, false };
-                },
-                '[' => { // link
-                    if (nextEql(self.raw_wikitext, "[[", i)) {
-                        if (cur_text_node.len > 0)
-                            arg.values.append(
-                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                            );
-
-                        i, const wkl_ctx = try self.parseWikiLink(i);
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .wiki_link = wkl_ctx }),
-                        );
-                    } else if (nextEql(self.raw_wikitext, "[[http", i)) {
-                        if (cur_text_node.len > 0)
-                            arg.values.append(
-                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                            );
-
-                        i, const el_ctx = try self.parseExternalLink(i);
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .external_link = el_ctx }),
-                        );
-                    } else {
-                        i += 1;
-                        cur_text_node.len += 1;
-                        continue;
-                    }
-
-                    cur_text_node = self.raw_wikitext[i..];
-                    cur_text_node.len = 0;
-                },
-                else => {
-                    i += 1;
-                    cur_text_node.len += 1;
-                },
-            }
+    pub fn firstNode(s: *const Self, nt: NodeType) ?*MWAstNode {
+        var it = s.first_child;
+        while (it) |node| : (it = node.next) {
+            if (node.nodeType() == nt)
+                return node;
         }
-
-        return FAIL;
+        return null;
     }
 
-    /// Returns i pointing to after pointer, errors otherwise
-    fn parseTable(self: *Self, start: usize) !usize {
-        const FAIL = ParseError.IncompleteTable;
-
-        var i = start + "{|".len;
-
-        while (i < self.raw_wikitext.len) {
-            i = try skipUntilOneOf(self.raw_wikitext, &.{'|'}, i, FAIL);
-            if (nextEql(self.raw_wikitext, "|}", i))
-                return i + "|}".len;
-            i += "|".len;
+    pub fn asText(s: *Self) ![]const u8 {
+        switch (s.n) {
+            .text => |d| return d,
+            else => return Error.InvalidDataCast,
         }
-
-        return FAIL;
     }
 
-    fn parseWikiLink(self: *Self, start: usize) ParseError!struct { usize, WikiLinkCtx } {
-        const FAIL = ParseError.BadWikiLink;
-
-        // skip [[ and single line whitespace after
-        var i = start + "[[".len;
-        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
-
-        // find end of article
-        const article_start = i;
-        var namespace_end_opt: ?usize = null;
-        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', ':', '|', ']' }, i, FAIL);
-
-        // namspaced link, save namespace end
-        if (self.raw_wikitext[i] == ':') {
-            namespace_end_opt = i;
-            i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', '|', ']' }, i, FAIL);
+    pub fn asTemplate(s: *Self) !Template {
+        switch (s.n) {
+            .template => |t| return t,
+            else => return Error.InvalidDataCast,
         }
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
-
-        const article_name = blk: {
-            if (namespace_end_opt) |namespace_end| {
-                break :blk std.mem.trimRight(u8, self.raw_wikitext[namespace_end + ":".len .. i], " \t");
-            } else {
-                break :blk std.mem.trimRight(u8, self.raw_wikitext[article_start..i], " \t");
-            }
-        };
-        const namespace = blk: {
-            if (namespace_end_opt) |namespace_end| {
-                break :blk WikiLinkCtx.Namepace.fromStr(self.raw_wikitext[article_start..namespace_end]);
-            } else {
-                break :blk WikiLinkCtx.Namepace.Main;
-            }
-        };
-
-        // skip whitespace after article name
-        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
-
-        // if link ends return
-        if (self.raw_wikitext[i] == ']') {
-            if (nextEql(self.raw_wikitext, "]]", i))
-                return .{ i + "]]".len, .{ .article = article_name, .namespace = namespace } };
-            return FAIL;
-        }
-
-        if (self.raw_wikitext[i] != '|')
-            return FAIL;
-
-        i += "|".len;
-
-        // parse args
-        var arg_list = WikiLinkCtx.WLArgList{};
-        const ArgNode = WikiLinkCtx.WLArgNode;
-
-        while (i < self.raw_wikitext.len) {
-            i, const arg, const last = try self.parseWikiLinkArgument(i);
-            arg_list.append(
-                try newNode(self.a, ArgNode, arg),
-            );
-
-            if (last) {
-                return .{ i, .{
-                    .article = article_name,
-                    .args = arg_list,
-                    .namespace = namespace,
-                } };
-            }
-        }
-
-        return FAIL;
     }
 
-    fn parseWikiLinkArgument(self: *Self, start: usize) ParseError!struct { usize, WikiLinkCtx.WLArg, bool } {
-        const FAIL = ParseError.BadTemplate;
-        const ValueNode = WikiLinkCtx.WLArg.ValueNode;
-
-        var arg = WikiLinkCtx.WLArg{};
-
-        var i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, start, FAIL);
-
-        const arg_start = i;
-        var arg_name_end_opt: ?usize = null;
-
-        var cur_text_node = self.raw_wikitext[i..];
-        cur_text_node.len = 0;
-
-        while (i < self.raw_wikitext.len) {
-            switch (self.raw_wikitext[i]) {
-                '=' => {
-                    arg_name_end_opt = i;
-                    i += 1;
-                    cur_text_node = self.raw_wikitext[i..];
-                    cur_text_node.len = 0;
-                },
-                '<' => {
-                    if (cur_text_node.len > 0)
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                        );
-
-                    if (nextEql(self.raw_wikitext, "!--", i + 1)) { // comment
-                        i = try self.skipHtmlComment(i);
-                    } else { // html tag
-                        i, const ht_ctx = try self.parseHtmlTag(i);
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .html_tag = ht_ctx }),
-                        );
-                    }
-
-                    cur_text_node = self.raw_wikitext[i..];
-                    cur_text_node.len = 0;
-                },
-                ']' => {
-                    if (nextEql(self.raw_wikitext, "]]", i)) { // done!
-                        if (cur_text_node.len > 0)
-                            arg.values.append(
-                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                            );
-
-                        if (arg_name_end_opt) |arg_name_end|
-                            arg.name = std.mem.trimRight(u8, self.raw_wikitext[arg_start..arg_name_end], &.{ ' ', '\t', '\n' });
-
-                        return .{ i + "}}".len, arg, true };
-                    } else {
-                        return FAIL;
-                    }
-                },
-                '{' => {
-                    if (nextEql(self.raw_wikitext, "{{", i)) { // nested tag
-                        if (cur_text_node.len > 0)
-                            arg.values.append(
-                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                            );
-
-                        i, const t_ctx = try self.parseTemplate(i);
-
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .template = t_ctx }),
-                        );
-
-                        cur_text_node = self.raw_wikitext[i..];
-                        cur_text_node.len = 0;
-                    } else { // continue with { as text
-                        i += 1;
-                        cur_text_node.len += 1;
-                    }
-                },
-                '|' => { // done!
-                    if (cur_text_node.len > 0)
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                        );
-
-                    if (arg_name_end_opt) |arg_name_end|
-                        arg.name = std.mem.trimRight(u8, self.raw_wikitext[arg_start..arg_name_end], &.{ ' ', '\t', '\n' });
-
-                    return .{ i + "|".len, arg, false };
-                },
-                '[' => { // link
-
-                    if (nextEql(self.raw_wikitext, "[[", i)) {
-                        if (cur_text_node.len > 0)
-                            arg.values.append(
-                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                            );
-
-                        i, const wkl_ctx = try self.parseWikiLink(i);
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .wiki_link = wkl_ctx }),
-                        );
-                    } else if (nextEql(self.raw_wikitext, "[[http", i)) {
-                        if (cur_text_node.len > 0)
-                            arg.values.append(
-                                try newNode(self.a, ValueNode, .{ .text = cur_text_node }),
-                            );
-
-                        i, const el_ctx = try self.parseExternalLink(i);
-                        arg.values.append(
-                            try newNode(self.a, ValueNode, .{ .external_link = el_ctx }),
-                        );
-                    } else {
-                        i += 1;
-                        cur_text_node.len += 1;
-                        continue;
-                    }
-
-                    cur_text_node = self.raw_wikitext[i..];
-                    cur_text_node.len = 0;
-                },
-                else => {
-                    i += 1;
-                    cur_text_node.len += 1;
-                },
-            }
+    pub fn asArg(s: *Self) !Argument {
+        switch (s.n) {
+            .argument => |a| return a,
+            else => return Error.InvalidDataCast,
         }
-
-        return FAIL;
     }
 
-    fn parseExternalLink(self: *Self, start: usize) ParseError!struct { usize, ExternalLinkCtx } {
-        const FAIL = ParseError.BadExternalLink;
-
-        // skip opening [
-        var i = start + "[".len;
-
-        // extract url
-        const url_start = i;
-        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', ' ', '\t', ']' }, i, FAIL);
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
-        const url = self.raw_wikitext[url_start..i];
-
-        // skip whitespace after url
-        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t' }, i, FAIL);
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
-
-        // if no name found, return
-        if (self.raw_wikitext[i] == ']')
-            return .{ i + 1, .{ .url = url } };
-
-        // get display name
-        const name_start = i;
-        i = try skipUntilOneOf(self.raw_wikitext, &.{ '\n', ']' }, i, FAIL);
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
-        const name = self.raw_wikitext[name_start..i];
-
-        if (self.raw_wikitext[i] != ']')
-            return FAIL;
-
-        return .{ i + 1, .{ .url = url, .title = name } };
+    pub fn asExternalLink(s: *Self) !ExternalLink {
+        switch (s.n) {
+            .external_link => |el| return el,
+            else => return Error.InvalidDataCast,
+        }
     }
 
-    /// `i` should point to the opening `<`
-    fn parseHtmlTag(self: *Self, start: usize) ParseError!struct { usize, HtmlTagCtx } {
-        const FAIL = ParseError.InvalidHtmlTag;
-
-        var i = try advance(start, "<".len, self.raw_wikitext, FAIL);
-        if (isWhiteSpace(self.raw_wikitext[i]))
-            return FAIL;
-        if (self.raw_wikitext[i] == '/')
-            return ParseError.SpuriousClosedHtmlTag;
-
-        const tag_name_start = i;
-        i = try skipUntilOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL);
-        if (i == tag_name_start)
-            return FAIL;
-        const tag_name = self.raw_wikitext[tag_name_start..i];
-
-        // skip whitespace after tag name
-        i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
-
-        const attribute_name_pred = struct {
-            /// Stops on ' ', '\n', '\r', '\t', '/', '>', '='
-            fn attribute_name_pred(ch: u8) bool {
-                switch (ch) {
-                    ' ', '\n', '\r', '\t', '/', '>', '=' => return false,
-                    else => return true,
-                }
-            }
-        }.attribute_name_pred;
-
-        // attempt to find attributes
-        var attrs = HtmlTagCtx.AttrList{};
-        while (attribute_name_pred(self.raw_wikitext[i])) {
-            if (i >= self.raw_wikitext.len)
-                return FAIL;
-
-            // extract attr name
-            const attr_name_start = i;
-            i = try skip(self.raw_wikitext, attribute_name_pred, i, FAIL);
-            if (attr_name_start == i)
-                return FAIL;
-            const attr_name = self.raw_wikitext[attr_name_start..i];
-
-            // skip whitespace after attr name
-            i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
-
-            // skip '='
-            if (self.raw_wikitext[i] != '=')
-                return FAIL;
-            i += "=".len;
-
-            // skip whitespace after =
-            i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
-
-            // skip quote and remember if it was ' or " or not present
-            var quote: u8 = self.raw_wikitext[i];
-            if (quote == '"' or quote == '\'') {
-                i += 1;
-            } else {
-                quote = 0;
-            }
-
-            // get attr value
-            const attr_value_start = i;
-            switch (quote) {
-                '\'' => i = try skipUntilOneOf(self.raw_wikitext, &.{'\''}, i, FAIL),
-                '"' => i = try skipUntilOneOf(self.raw_wikitext, &.{'"'}, i, FAIL),
-                0 => i = try skipUntilOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL),
-                else => unreachable,
-            }
-            const attr_value = self.raw_wikitext[attr_value_start..i];
-
-            // skip quote if it existed
-            if (quote != 0)
-                i += 1;
-
-            attrs.append(
-                try newNode(self.a, HtmlTagCtx.AttrNode, .{ .name = attr_name, .value = attr_value }),
-            );
-
-            // skip whitespace after attr name
-            i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
+    pub fn asWikiLink(s: *Self) !WikiLink {
+        switch (s.n) {
+            .wiki_link => |wl| return wl,
+            else => return Error.InvalidDataCast,
         }
-
-        // Handle self closing tag
-        if (self.raw_wikitext[i] == '/') {
-            if (i + 1 < self.raw_wikitext.len and self.raw_wikitext[i + 1] == '>')
-                return .{ i + "/>".len, .{ .tag_name = tag_name, .attrs = attrs } };
-            return FAIL;
-        }
-
-        // skip closing '>'
-        if (self.raw_wikitext[i] != '>')
-            return FAIL;
-        i += ">".len;
-
-        if (forbiddenClosingTag(tag_name))
-            return .{ i, .{ .tag_name = tag_name, .attrs = attrs } };
-
-        var children = HtmlTagCtx.ChildList{};
-
-        // math tags are special and everything is fair game until </math>
-        // nowiki means discard all parsing, same effect
-        if (std.mem.eql(u8, tag_name, "math")) {
-            const latex_content_start = i;
-            while (i < self.raw_wikitext.len - "</math".len) : (i += 1) {
-                if (std.mem.eql(u8, self.raw_wikitext[i .. i + "</math".len], "</math")) {
-                    const latex_content = self.raw_wikitext[latex_content_start..i];
-                    children.append(
-                        try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = latex_content }),
-                    );
-
-                    i += "</math".len;
-                    i = try skipWhileOneOf(self.raw_wikitext, " \t\n", i, ParseError.InvalidMathTag);
-                    if (self.raw_wikitext[i] != '>')
-                        return ParseError.InvalidMathTag;
-
-                    return .{ i + ">".len, .{ .tag_name = tag_name, .attrs = attrs, .children = children } };
-                }
-            }
-        }
-        if (std.mem.eql(u8, tag_name, "nowiki")) {
-            const escaped_content_start = i;
-            while (i < self.raw_wikitext.len - "</nowiki".len) : (i += 1) {
-                if (std.mem.eql(u8, self.raw_wikitext[i .. i + "</nowiki".len], "</nowiki")) {
-                    const escaped_content = self.raw_wikitext[escaped_content_start..i];
-                    children.append(
-                        try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = escaped_content }),
-                    );
-
-                    i += "</nowiki".len;
-                    i = try skipWhileOneOf(self.raw_wikitext, " \t\n", i, ParseError.InvalidMathTag);
-                    if (self.raw_wikitext[i] != '>')
-                        return ParseError.InvalidMathTag;
-
-                    return .{ i + ">".len, .{ .tag_name = tag_name, .attrs = attrs, .children = children } };
-                }
-            }
-        }
-
-        var cur_text_node = self.raw_wikitext[i..];
-        cur_text_node.len = 0;
-        while (i < self.raw_wikitext.len) {
-            if (nextEql(self.raw_wikitext, "</", i)) { // if tag ends, end it!
-                i += "</".len;
-
-                // get close tag name
-                const close_tag_name_start = i;
-                i = try skipUntilOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL);
-                const close_tag_name = self.raw_wikitext[close_tag_name_start..i];
-
-                // validate
-                if (!std.mem.eql(u8, close_tag_name, tag_name))
-                    return FAIL;
-
-                // skip whitespace after tag name
-                i = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
-                if (self.raw_wikitext[i] != '>')
-                    return FAIL;
-
-                children.append(
-                    try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = cur_text_node }),
-                );
-
-                return .{
-                    i + 1,
-                    .{
-                        .tag_name = tag_name,
-                        .attrs = attrs,
-                        .children = children,
-                    },
-                };
-            } else if (nextEql(self.raw_wikitext, "<!--", i)) { // comment ... skip it!
-                if (cur_text_node.len > 0)
-                    children.append(
-                        try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = cur_text_node }),
-                    );
-
-                i = try self.skipHtmlComment(i);
-
-                cur_text_node = self.raw_wikitext[i..];
-                cur_text_node.len = 0;
-            } else if (self.raw_wikitext[i] == '<') { // another html tag
-                if (cur_text_node.len > 0)
-                    children.append(
-                        try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = cur_text_node }),
-                    );
-
-                i, const ht_ctx = try self.parseHtmlTag(i);
-                children.append(
-                    try newNode(self.a, HtmlTagCtx.ChildNode, .{ .html_tag = ht_ctx }),
-                );
-
-                cur_text_node = self.raw_wikitext[i..];
-                cur_text_node.len = 0;
-            } else if (nextEql(self.raw_wikitext, "{{", i)) { // template
-                if (cur_text_node.len > 0)
-                    children.append(
-                        try newNode(self.a, HtmlTagCtx.ChildNode, .{ .text = cur_text_node }),
-                    );
-
-                i, const t_ctx = try self.parseTemplate(i);
-                children.append(
-                    try newNode(self.a, HtmlTagCtx.ChildNode, .{ .template = t_ctx }),
-                );
-
-                cur_text_node = self.raw_wikitext[i..];
-                cur_text_node.len = 0;
-            } else {
-                i += 1;
-                cur_text_node.len += 1;
-            }
-        }
-
-        return FAIL;
     }
 
-    /// moves to `i` to after the comment,
-    /// or returns `ParseError.UnclosedHtmlComment` if none is found
-    ///
-    /// `i` should point to the first char of `<!--`
-    fn skipHtmlComment(self: *Self, start: usize) !usize {
-        const FAIL = ParseError.UnclosedHtmlComment;
-
-        var i = start + "<!--".len;
-        while (i <= self.raw_wikitext.len - "-->".len) : (i += 1) {
-            if (std.mem.eql(u8, self.raw_wikitext[i .. i + "-->".len], "-->"))
-                return i + "-->".len;
+    pub fn asHtmlTag(s: *Self) !HtmlTag {
+        switch (s.n) {
+            .html_tag => |ht| return ht,
+            else => return Error.InvalidDataCast,
         }
-
-        return FAIL;
     }
 
-    /// attempts to find html entity from '&' start character
-    ///
-    /// Returns `ParseError.IncompleteHtmlEntity` if not found
-    fn parseHtmlEntity(self: *Self, start: usize) !usize {
-        const FAIL = ParseError.IncompleteHtmlEntity;
+    pub fn asHtmlEntity(s: *Self) ![]const u8 {
+        switch (s.n) {
+            .html_entity => |he| return he,
+            else => return Error.InvalidDataCast,
+        }
+    }
 
-        var i: usize = try advance(start, "&".len, self.raw_wikitext, FAIL);
+    pub fn asHeading(s: *Self) !Heading {
+        switch (s.n) {
+            .heading => |heading| return heading,
+            else => return Error.InvalidDataCast,
+        }
+    }
 
-        if (self.raw_wikitext[i] == '#') {
-            i += 1;
-            // numeric, at least 2-4 digits
-            var n_digits: usize = 0;
-            while (i < self.raw_wikitext.len) : (i += 1) {
-                const ch = self.raw_wikitext[i];
-                if (ch == ';') {
-                    if (2 <= n_digits and n_digits <= 4) {
-                        try self.nodes.append(.{ .html_entity = self.raw_wikitext[start .. i + 1] });
-                        return i + 1;
-                    } else {
-                        return FAIL;
-                    }
-                }
+    pub fn createChildNode(s: *Self, n: NodeData) error{OutOfMemory}!*MWAstNode {
+        const new_node = try s.a.create(Self);
+        new_node.* = .{ .a = s.a, .parent = s, .n = n };
+        return new_node;
+    }
 
-                if (isDigit(ch)) {
-                    n_digits += 1;
-                } else {
-                    return FAIL;
-                }
-            }
+    pub fn insertChildAfter(s: *Self, node: *MWAstNode, new_node: *MWAstNode) void {
+        new_node.prev = node;
+        if (node.next) |next_node| {
+            // Intermediate node.
+            new_node.next = next_node;
+            next_node.prev = new_node;
         } else {
-            while (i < self.raw_wikitext.len) : (i += 1) {
-                const ch = self.raw_wikitext[i];
-                if (ch == ';') {
-                    try self.nodes.append(.{ .html_entity = self.raw_wikitext[start .. i + 1] });
-                    return i + 1;
-                }
-            }
+            // Last element of the list.
+            new_node.next = null;
+            s.last_child = new_node;
         }
+        node.next = new_node;
 
-        return FAIL;
+        s.n_children += 1;
     }
 
-    /// called on `start` pointing to '=' at the start of the line
-    /// or start of an article.
-    ///
-    /// Skips inline html elements
-    fn parseHeading(self: *Self, start: usize) ParseError!usize {
-        const FAIL = ParseError.IncompleteHeading;
-
-        var i: usize = start;
-
-        // parse leading =, remembering how many
-        var level: usize = 0;
-        while (i < self.raw_wikitext.len) : (i += 1) {
-            const ch = self.raw_wikitext[i];
-            switch (ch) {
-                '=' => level += 1,
-                '\n' => return FAIL,
-                else => break,
-            }
+    pub fn insertChildBefore(s: *Self, node: *MWAstNode, new_node: *MWAstNode) void {
+        new_node.next = node;
+        if (node.prev) |prev_node| {
+            // Intermediate node.
+            new_node.prev = prev_node;
+            prev_node.next = new_node;
+        } else {
+            // First element of the list.
+            new_node.prev = null;
+            s.first_child = new_node;
         }
+        node.prev = new_node;
 
-        const text_start = try skipWhileOneOf(self.raw_wikitext, &.{ ' ', '\t', '\n' }, i, FAIL);
-        try errOnLineBreak(self.raw_wikitext[i], FAIL);
-
-        var cur_text_node = self.raw_wikitext[i..];
-        cur_text_node.len = 0;
-
-        while (i < self.raw_wikitext.len) {
-            const ch = self.raw_wikitext[i];
-            switch (ch) {
-                '<' => { // skip html tag
-                    if (nextEql(self.raw_wikitext, "<!--", i)) {
-                        i = try self.skipHtmlComment(i);
-                    } else {
-                        i, _ = try self.parseHtmlTag(i);
-                    }
-                },
-                '=' => { // end of heading
-                    const text = std.mem.trimRight(u8, self.raw_wikitext[text_start..i], &.{ ' ', '\t' });
-                    if (text.len == 0)
-                        return FAIL;
-
-                    if (!nextEqlCount(self.raw_wikitext, '=', level, i))
-                        return FAIL;
-
-                    try self.nodes.append(.{ .heading = .{ .heading = text, .level = level } });
-                    return i + level * "=".len;
-                },
-                '\n' => return FAIL,
-                else => i += 1,
-            }
-        }
-
-        return FAIL;
+        s.n_children += 1;
     }
 
-    /// Returns size of the node
-    ///
-    /// Does not handle nesting!
-    ///
-    /// Returns `ParseError.IncompleteArgument` if unclosed
-    fn parseArgument(self: *Self, start: usize) !usize {
-        const FAIL = ParseError.IncompleteArgument;
-
-        var i: usize = start + "{{{".len;
-        while (i < self.raw_wikitext.len) {
-            const ch = self.raw_wikitext[i];
-
-            if (ch == '}') {
-                if (nextEql(self.raw_wikitext, "}}}", i)) {
-                    const end = i + "}}}".len;
-                    const text = self.raw_wikitext[start..end];
-                    try self.nodes.append(.{ .argument = text });
-                    return end;
-                } else {
-                    return FAIL;
-                }
-            }
-
-            i += 1;
+    pub fn appendChild(s: *Self, new_node: *MWAstNode) void {
+        if (s.last_child) |last_child| {
+            // Insert after last.
+            s.insertChildAfter(last_child, new_node);
+        } else {
+            // Empty list.
+            s.prependChild(new_node);
         }
+    }
 
-        return FAIL;
+    pub fn prependChild(s: *Self, new_node: *MWAstNode) void {
+        if (s.first_child) |first_child| {
+            // Insert before first.
+            s.insertChildBefore(first_child, new_node);
+        } else {
+            // Empty list.
+            s.first_child = new_node;
+            s.last_child = new_node;
+            new_node.prev = null;
+            new_node.next = null;
+
+            s.n_children = 1;
+        }
     }
 };
 
-/// Skips until `i` exceeds `buf.len` (returning `E`) or a character not in `continues` is found
-inline fn skipWhileOneOf(buf: []const u8, comptime continues: []const u8, i: usize, E: MWParser.ParseError) MWParser.ParseError!usize {
-    var _i = i;
+const Error = error{
+    IncompleteArgument,
+    IncompleteHeading,
+    IncompleteHtmlEntity,
+    UnclosedHtmlComment,
+    InvalidHtmlTag,
+    InvalidMathTag,
+    InvalidNoWikiTag,
+    SpuriousClosedHtmlTag,
+    BadExternalLink,
+    BadWikiLink,
+    IncompleteTable,
+    BadTemplate,
+    BadTemplateArg,
+    BadWikiLinkArg,
 
-    while (_i < buf.len) : (_i += 1) {
-        var cont: bool = false;
-        inline for (continues) |c|
-            cont = cont or buf[_i] == c;
-        if (!cont)
-            return _i;
+    /// using `asText` on a template node
+    InvalidDataCast,
+
+    OutOfMemory,
+};
+
+pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
+    var doc: MWAstNode = .{ .a = a };
+
+    var i: usize = 0;
+
+    // chars are text by default
+    var cur_text_node = text[i..];
+    cur_text_node.len = 0;
+
+    while (i < text.len) {
+        const ch = text[i];
+        switch (ch) {
+            '{' => {
+                if (nextEql(text, "{", i + 1)) {
+                    // Template.
+                    try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
+
+                    i = try parseTemplate(&doc, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else if (nextEql(text, "|", i + 1)) {
+                    // Table.
+                    try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
+
+                    i = try skipTable(text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else {
+                    // Text.
+                    cur_text_node.len += 1;
+                    i += 1;
+                }
+            },
+
+            '[' => {
+                if (nextEql(text, "[", i + 1)) {
+                    // Wikilink.
+                    try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
+
+                    i = try parseWikiLink(&doc, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else if (nextEql(text, "http", i + 1)) {
+                    // External Link.
+                    try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
+
+                    i = try parseExternalLink(&doc, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else {
+                    // Text.
+                    i += 1;
+                    cur_text_node.len += 1;
+                }
+            },
+
+            '<' => {
+                try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
+
+                if (nextEql(text, "!--", i + 1)) {
+                    // HTML Comment.
+                    i = try skipHtmlComment(text, i);
+                } else {
+                    // HTML Tag.
+                    i = try parseHtmlTag(&doc, text, i);
+                }
+
+                cur_text_node = text[i..];
+                cur_text_node.len = 0;
+            },
+
+            '&' => {
+                i, const html_entity_node = parseHtmlEntity(&doc, text, i) catch |err| switch (err) {
+                    Error.IncompleteHtmlEntity => {
+                        // Failover to text.
+                        i += 1;
+                        cur_text_node.len += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+
+                try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
+                doc.appendChild(html_entity_node);
+
+                cur_text_node = text[i..];
+                cur_text_node.len = 0;
+            },
+
+            '=' => {
+                // An article or line start with an '=' is expected to be a heading.
+                if (i == 0 or (i > 0 and text[i - 1] == '\n')) {
+                    try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
+
+                    i = try parseHeading(&doc, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else {
+                    // Text.
+                    cur_text_node.len += 1;
+                    i += 1;
+                }
+            },
+
+            else => {
+                // Default, text.
+                cur_text_node.len += 1;
+                i += 1;
+            },
+        }
+    }
+
+    try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
+
+    return doc;
+}
+
+///////////////////////////////////////////////////////////////////////
+// Node type specific parser functions.
+
+/// `i` should point to the opening `<`
+fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+    const FAIL = Error.InvalidHtmlTag;
+
+    const html_tag_node = try parent.createChildNode(.{ .html_tag = .{} });
+    defer parent.appendChild(html_tag_node);
+
+    // Skip opening '<'.
+    var i = try advance(start, "<".len, text, FAIL);
+    if (std.ascii.isWhitespace(text[i]))
+        return FAIL;
+    if (text[i] == '/')
+        return Error.SpuriousClosedHtmlTag;
+
+    // Find end of the tag name.
+    const tag_name_start = i;
+    i = try skipUntilOneOf(text, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL);
+    if (i == tag_name_start)
+        return FAIL;
+    const tag_name = text[tag_name_start..i];
+
+    // Skip whitespace after tag name.
+    i = try skipWhileOneOf(text, &.{ ' ', '\t', '\n' }, i, FAIL);
+
+    // Parse attributes i.e. `<tag attr1=value1 ... />`.
+    var attrs = HtmlTag.AttrList{};
+    while (std.mem.count(u8, " \n\t/>=", text[i .. i + 1]) == 0) {
+        if (i >= text.len)
+            return FAIL;
+
+        // Attribute name.
+        const attr_name_start = i;
+        i = try skipUntilOneOf(text, " \n\t/>=", i, FAIL);
+        if (attr_name_start == i)
+            return FAIL;
+        const attr_name = text[attr_name_start..i];
+
+        // Skip whitespace after attr name.
+        i = try skipWhileOneOf(text, &.{ ' ', '\t', '\n' }, i, FAIL);
+
+        // Skip '='.
+        if (text[i] != '=')
+            return FAIL;
+        i += "=".len;
+
+        // Skip whitespace after =.
+        i = try skipWhileOneOf(text, &.{ ' ', '\t', '\n' }, i, FAIL);
+
+        // Skip quote and remember if it was ' or " or not present.
+        var quote: u8 = text[i];
+        if (quote == '"' or quote == '\'') {
+            i += 1;
+        } else {
+            quote = 0;
+        }
+
+        // Seek attribute value.
+        const attr_value_start = i;
+        switch (quote) {
+            '\'' => i = try skipUntilOneOf(text, &.{'\''}, i, FAIL),
+            '"' => i = try skipUntilOneOf(text, &.{'"'}, i, FAIL),
+            0 => i = try skipUntilOneOf(text, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL),
+            else => unreachable,
+        }
+        const attr_value = text[attr_value_start..i];
+
+        // Skip quote if it existed.
+        if (quote != 0)
+            i += 1;
+
+        const attr_node = try parent.a.create(HtmlTag.AttrNode);
+        attr_node.*.data = .{ .name = attr_name, .value = attr_value };
+        attrs.append(attr_node);
+
+        // Skip whitespace after attr name.
+        i = try skipWhileOneOf(text, &.{ ' ', '\t', '\n' }, i, FAIL);
+    }
+
+    html_tag_node.*.n = .{ .html_tag = .{ .tag_name = tag_name, .attrs = attrs } };
+
+    // Handle self closing tag
+    if (text[i] == '/') {
+        if (i + 1 < text.len and text[i + 1] == '>')
+            return i + "/>".len;
+        return FAIL;
+    }
+
+    // Skip closing '>'.
+    if (text[i] != '>')
+        return FAIL;
+    i += ">".len;
+
+    // These tags must be self closed and support "only open" form like `<br>`
+    const forbiddenClosingTagNames = [_][]const u8{ "area", "base", "basefont", "br", "col", "frame", "hr", "img", "input", "isindex", "link", "meta", "param" };
+    inline for (forbiddenClosingTagNames) |_tag_name| {
+        if (std.mem.eql(u8, _tag_name, tag_name))
+            return i;
+    }
+
+    // `<nowiki>` and `<math>` do not look for nested wikicode elements.
+    if (std.mem.eql(u8, tag_name, "math"))
+        return try parseHtmlTagEscaped(html_tag_node, "</math", text, i, Error.InvalidMathTag);
+    if (std.mem.eql(u8, tag_name, "nowiki")) {
+        return try parseHtmlTagEscaped(html_tag_node, "</nowiki", text, i, Error.InvalidMathTag);
+    }
+
+    var cur_text_node = text[i..];
+    cur_text_node.len = 0;
+    while (i < text.len) {
+        if (nextEql(text, "</", i)) {
+            // Tag end.
+            i += "</".len;
+
+            try createAndAppendTextNodeIfNotEmpty(html_tag_node, cur_text_node);
+
+            // Get close tag name.
+            const close_tag_name_start = i;
+            i = try skipUntilOneOf(text, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL);
+            const close_tag_name = text[close_tag_name_start..i];
+
+            // Validate.
+            if (!std.mem.eql(u8, close_tag_name, tag_name))
+                return FAIL;
+
+            // Skip whitespace after tag name.
+            i = try skipWhileOneOf(text, &.{ ' ', '\t', '\n' }, i, FAIL);
+            if (text[i] != '>')
+                return FAIL;
+
+            return i + 1;
+        } else if (nextEql(text, "<!--", i)) {
+            // HTML comment.
+            try createAndAppendTextNodeIfNotEmpty(html_tag_node, cur_text_node);
+
+            i = try skipHtmlComment(text, i);
+
+            cur_text_node = text[i..];
+            cur_text_node.len = 0;
+        } else if (text[i] == '<') {
+            // Nested html tag.
+            try createAndAppendTextNodeIfNotEmpty(html_tag_node, cur_text_node);
+
+            i = try parseHtmlTag(html_tag_node, text, i);
+
+            cur_text_node = text[i..];
+            cur_text_node.len = 0;
+        } else if (nextEql(text, "{{", i)) {
+            // Template.
+            try createAndAppendTextNodeIfNotEmpty(html_tag_node, cur_text_node);
+
+            i = try parseTemplate(html_tag_node, text, i);
+
+            cur_text_node = text[i..];
+            cur_text_node.len = 0;
+        } else {
+            // Text.
+            i += 1;
+            cur_text_node.len += 1;
+        }
+    }
+
+    return FAIL;
+}
+
+/// Finds `end_tag` without looking for nested wikicode elements
+///
+/// Tag end should have "</" prepended
+fn parseHtmlTagEscaped(html_tag_node: *MWAstNode, tag_end: []const u8, text: []const u8, pos: usize, E: Error) Error!usize {
+    const content_start = pos;
+    var i = pos;
+    while (i < text.len - tag_end.len) : (i += 1) {
+        if (std.mem.eql(u8, text[i .. i + tag_end.len], tag_end)) {
+            const content_node = try html_tag_node.createChildNode(.{ .text = text[content_start..i] });
+            html_tag_node.appendChild(content_node);
+            i += tag_end.len;
+
+            i = try skipWhileOneOf(text, " \t\n", i, E);
+            if (text[i] != '>')
+                return E;
+
+            return i + ">".len;
+        }
     }
 
     return E;
 }
 
+fn parseWikiLink(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+    const FAIL = Error.BadWikiLink;
+
+    const wiki_link_node = try parent.createChildNode(.{ .wiki_link = .{ .article = "" } });
+    defer parent.appendChild(wiki_link_node);
+
+    // Skip [[ and single line whitespace after.
+    var i = start + "[[".len;
+    i = try skipWhileOneOf(text, &.{ ' ', '\t' }, i, FAIL);
+    try errOnLineBreak(text[i], FAIL);
+
+    // Find end of article.
+    var article_start = i;
+    var namespace: WikiLink.Namepace = .Main;
+    i = try skipUntilOneOf(text, &.{ '\n', ':', '|', ']' }, i, FAIL);
+
+    if (text[i] == ':') {
+        // Namespaced link. i.e. File:img.png
+        namespace = WikiLink.Namepace.fromStr(text[article_start..i]);
+        article_start = i + ":".len;
+        i = try skipUntilOneOf(text, &.{ '\n', '|', ']' }, i, FAIL);
+    }
+    try errOnLineBreak(text[i], FAIL);
+
+    const article = std.mem.trimRight(u8, text[article_start..i], " \t");
+
+    // write data to node
+    wiki_link_node.*.n = .{ .wiki_link = .{ .article = article, .namespace = namespace } };
+
+    // Skip whitespace after article name.
+    i = try skipWhileOneOf(text, &.{ ' ', '\t' }, i, FAIL);
+    try errOnLineBreak(text[i], FAIL);
+
+    if (nextEql(text, "]]", i)) {
+        // No arguments.
+        return i + "]]".len;
+    }
+
+    if (text[i] != '|')
+        return FAIL;
+
+    i += "|".len;
+
+    while (i < text.len) {
+        i, const last = try parseArgument(wiki_link_node, text, i, Error.BadWikiLinkArg);
+
+        if (last)
+            return i;
+    }
+
+    return FAIL;
+}
+
+fn parseTemplate(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+    const FAIL = Error.BadTemplate;
+
+    var i = start + "{{".len;
+
+    // Get template name.
+    const template_name_start = i;
+    i = try skipUntilOneOf(text, &.{ '\n', '}', '|' }, i, FAIL);
+    const template_name = text[template_name_start..i];
+
+    const template_node = try parent.createChildNode(.{ .template = .{ .name = template_name } });
+    defer parent.appendChild(template_node);
+
+    // Skip whitespace after template name.
+    i = try skipWhileOneOf(text, &.{ '\n', ' ', '\t' }, i, FAIL);
+
+    // Template closes.
+    if (nextEql(text, "}}", i))
+        return i + "}}".len;
+
+    if (text[i] != '|')
+        return FAIL;
+    i += "|".len;
+
+    // Parse args.
+    while (i < text.len) {
+        i, const last = try parseArgument(template_node, text, i, Error.BadTemplateArg);
+        if (last)
+            return i;
+    }
+
+    return FAIL;
+}
+
+/// Parses template / wikilink argument with start pointing to the first character
+fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error) Error!struct { usize, bool } {
+    std.debug.assert(parent.nodeType() == .wiki_link or parent.nodeType() == .template);
+
+    var arg_node = try parent.createChildNode(.{ .argument = .{} });
+    defer parent.appendChild(arg_node);
+
+    var i = try skipWhileOneOf(text, " \t\n", start, E);
+
+    const arg_start = i;
+
+    var cur_text_node = text[i..];
+    cur_text_node.len = 0;
+
+    while (i < text.len) {
+        switch (text[i]) {
+            '=' => {
+                const arg_key = std.mem.trimRight(u8, text[arg_start..i], " \t\n");
+                arg_node.*.n = .{ .argument = .{ .key = arg_key } };
+
+                i += "=".len;
+
+                i = try skipWhileOneOf(text, " \t", i, E);
+
+                // DOI links are raw text in templates.
+                if (parent.nodeType() == .template and std.mem.eql(u8, "doi", arg_key)) {
+                    const doi_text_start = i;
+                    i = try skipUntilOneOf(text, &.{ ' ', '|', '}' }, i, E);
+                    const doi_text_node = try parent.createChildNode(.{ .text = text[doi_text_start..i] });
+                    arg_node.appendChild(doi_text_node);
+                    i = try skipWhileOneOf(text, " \t\n", i, E);
+                    const last = nextEql(text, "}}", i);
+                    return .{ i + "}}".len, last };
+                }
+
+                cur_text_node = text[i..];
+                cur_text_node.len = 0;
+            },
+            '<' => {
+                try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+
+                if (nextEql(text, "!--", i + 1)) {
+                    // Comment.
+                    i = try skipHtmlComment(text, i);
+                } else {
+                    // Html tag.
+                    i = try parseHtmlTag(arg_node, text, i);
+                }
+
+                cur_text_node = text[i..];
+                cur_text_node.len = 0;
+            },
+            '}' => {
+                if (parent.nodeType() == .template and nextEql(text, "}", i + 1)) {
+                    // Done. this is the last argument
+                    if (cur_text_node.len > 0 and cur_text_node[cur_text_node.len - 1] == '\n')
+                        cur_text_node.len -= 1;
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+                    return .{ i + "}}".len, true };
+                } else {
+                    // Continue with } as text.
+                    i += 1;
+                    cur_text_node.len += 1;
+                }
+            },
+            '{' => {
+                if (nextEql(text, "{", i + 1)) {
+                    // Nested tag.
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+
+                    i = try parseTemplate(arg_node, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else {
+                    // Continue with { as text.
+                    i += 1;
+                    cur_text_node.len += 1;
+                }
+            },
+            '|' => {
+                // Done!
+                if (cur_text_node.len > 0 and cur_text_node[cur_text_node.len - 1] == '\n')
+                    cur_text_node.len -= 1;
+                try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+                return .{ i + "|".len, false };
+            },
+            '[' => {
+                // Link.
+                if (nextEql(text, "[", i + 1)) {
+                    // Wikilink.
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+
+                    i = try parseWikiLink(arg_node, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else if (nextEql(text, "[http", i + 1)) {
+                    // External link.
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+
+                    i = try parseExternalLink(arg_node, text, i);
+
+                    cur_text_node = text[i..];
+                    cur_text_node.len = 0;
+                } else {
+                    i += 1;
+                    cur_text_node.len += 1;
+                }
+            },
+            ']' => {
+                if (parent.nodeType() == .wiki_link and nextEql(text, "]", i + 1)) {
+                    // Done. this is the last argument
+                    try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+                    return .{ i + "]]".len, true };
+                } else {
+                    // Continue with ] as text.
+                    i += 1;
+                    cur_text_node.len += 1;
+                }
+            },
+            '&' => {
+                i, const html_entity_node = parseHtmlEntity(arg_node, text, i) catch |err| switch (err) {
+                    Error.IncompleteHtmlEntity => {
+                        // Failover to text.
+                        i += 1;
+                        cur_text_node.len += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+
+                try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
+                arg_node.appendChild(html_entity_node);
+
+                cur_text_node = text[i..];
+                cur_text_node.len = 0;
+            },
+            else => {
+                i += 1;
+                cur_text_node.len += 1;
+            },
+        }
+    }
+
+    return E;
+}
+
+fn parseExternalLink(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+    const FAIL = Error.BadExternalLink;
+
+    // skip opening [
+    var i = start + "[".len;
+
+    // extract url
+    const url_start = i;
+    i = try skipUntilOneOf(text, &.{ '\n', ' ', '\t', ']' }, i, FAIL);
+    try errOnLineBreak(text[i], FAIL);
+    const url = text[url_start..i];
+
+    // skip whitespace after url
+    i = try skipWhileOneOf(text, &.{ ' ', '\t' }, i, FAIL);
+    try errOnLineBreak(text[i], FAIL);
+
+    // if no name found, return
+    if (text[i] == ']') {
+        const external_link_node = try parent.createChildNode(.{ .external_link = .{ .url = url } });
+        parent.appendChild(external_link_node);
+        return i + 1;
+    }
+
+    // get display name
+    const name_start = i;
+    i = try skipUntilOneOf(text, &.{ '\n', ']' }, i, FAIL);
+    try errOnLineBreak(text[i], FAIL);
+    const name = text[name_start..i];
+
+    if (text[i] != ']')
+        return FAIL;
+
+    const external_link_node = try parent.createChildNode(.{
+        .external_link = .{ .url = url, .title = name },
+    });
+    parent.appendChild(external_link_node);
+
+    return i + 1;
+}
+
+/// attempts to find html entity from '&' start character
+///
+/// Returns `Error.IncompleteHtmlEntity` if not found
+fn parseHtmlEntity(parent: *MWAstNode, text: []const u8, start: usize) Error!struct { usize, *MWAstNode } {
+    const FAIL = Error.IncompleteHtmlEntity;
+
+    var i: usize = try advance(start, "&".len, text, FAIL);
+
+    const MAX_ENTITY_LEN = blk: {
+        if (i + 6 < text.len)
+            break :blk i + 6;
+        break :blk text.len;
+    };
+
+    if (text[i] == '#') {
+        // Numeric.
+        i += "#".len;
+        if (i < text.len and text[i] == 'x') {
+            // Hex.
+            i += "x".len;
+        }
+        while (i < MAX_ENTITY_LEN) : (i += 1) {
+            if (text[i] == ';') {
+                const html_entity_node = try parent.createChildNode(.{ .html_entity = text[start .. i + 1] });
+                return .{ i + 1, html_entity_node };
+            }
+            if (!std.ascii.isDigit(text[i]))
+                return FAIL;
+        }
+    } else {
+        // Character.
+        while (i < MAX_ENTITY_LEN) : (i += 1) {
+            if (text[i] == ';') {
+                const html_entity_node = try parent.createChildNode(.{ .html_entity = text[start .. i + 1] });
+                return .{ i + 1, html_entity_node };
+            }
+        }
+    }
+
+    return FAIL;
+}
+
+fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+    const FAIL = Error.IncompleteHeading;
+
+    const heading_node = try parent.createChildNode(.{ .heading = .{ .level = 0 } });
+    defer parent.appendChild(heading_node);
+
+    var i: usize = start;
+
+    // Parse leading =, remembering how many.
+    var level: usize = 0;
+    while (i < text.len) : (i += 1) {
+        switch (text[i]) {
+            '=' => level += 1,
+            '\n' => return FAIL,
+            else => break,
+        }
+    }
+
+    heading_node.*.n = .{ .heading = .{ .level = level } };
+
+    i = try skipWhileOneOf(text, &.{ ' ', '\t', '\n' }, i, FAIL);
+    try errOnLineBreak(text[i], FAIL);
+
+    var cur_text_node = text[i..];
+    cur_text_node.len = 0;
+
+    while (i < text.len) {
+        switch (text[i]) {
+            '<' => {
+                // Html comment or tag
+                cur_text_node = std.mem.trimRight(u8, cur_text_node, &.{ ' ', '\t' });
+                try createAndAppendTextNodeIfNotEmpty(heading_node, cur_text_node);
+
+                if (nextEql(text, "<!--", i)) {
+                    i = try skipHtmlComment(text, i);
+                } else {
+                    i = try parseHtmlTag(heading_node, text, i);
+                }
+
+                cur_text_node = text[i..];
+                cur_text_node.len = 0;
+            },
+            '=' => {
+                // End of heading.
+                if (!nextEqlCount(text, '=', level, i))
+                    return FAIL;
+
+                cur_text_node = std.mem.trimRight(u8, cur_text_node, &.{ ' ', '\t' });
+
+                const txt_node = try parent.createChildNode(.{ .text = cur_text_node });
+                heading_node.appendChild(txt_node);
+
+                return i + level * "=".len;
+            },
+            '\n' => break,
+            else => {
+                // Text.
+                i += 1;
+                cur_text_node.len += 1;
+            },
+        }
+    }
+
+    return FAIL;
+}
+
+/// NOTE: This does not add a table node, it just skips after the closing `|}`
+///
+/// `pos` should point to the opening `{|`
+fn skipTable(text: []const u8, pos: usize) !usize {
+    var i = pos + "{|".len;
+
+    while (i < text.len) {
+        i = try skipUntilOneOf(text, &.{'|'}, i, Error.IncompleteTable);
+        if (nextEql(text, "}", i + 1))
+            return i + "|}".len;
+        i += "|".len;
+    }
+
+    return Error.IncompleteTable;
+}
+
+/// moves to `pos` to after the comment,
+/// or returns `Error.UnclosedHtmlComment` if none is found
+///
+/// `pos` should point to the first char of `<!--`
+fn skipHtmlComment(text: []const u8, pos: usize) !usize {
+    var i = pos + "<!--".len;
+    while (i <= text.len - "-->".len) : (i += 1) {
+        if (std.mem.eql(u8, text[i .. i + "-->".len], "-->"))
+            return i + "-->".len;
+    }
+    return Error.UnclosedHtmlComment;
+}
+
+///////////////////////////////////////////////////////////////////////
+// Parser utility functions.
+
+/// allocates and appends text node IF `text.len > 0`
+inline fn createAndAppendTextNodeIfNotEmpty(parent: *MWAstNode, text: []const u8) !void {
+    if (text.len == 0)
+        return;
+    const txt_node = try parent.createChildNode(.{ .text = text });
+    parent.appendChild(txt_node);
+}
+
 /// Skips until `i` exceeds `buf.len` (returning `E`) or a character in `stops` is found
-inline fn skipUntilOneOf(buf: []const u8, comptime stops: []const u8, i: usize, E: MWParser.ParseError) MWParser.ParseError!usize {
+inline fn skipUntilOneOf(buf: []const u8, comptime stops: []const u8, i: usize, E: Error) Error!usize {
     var _i = i;
 
     while (_i < buf.len) : (_i += 1) {
@@ -1122,61 +1033,6 @@ inline fn skipUntilOneOf(buf: []const u8, comptime stops: []const u8, i: usize, 
     }
 
     return E;
-}
-
-/// Advances `i` until `continue_pred` returns false
-///
-/// If end of `buf` is reached, returns error `E`
-///
-/// Predicate calls are inlined for performance
-inline fn skip(buf: []const u8, continue_pred: fn (u8) bool, _i: usize, E: MWParser.ParseError) MWParser.ParseError!usize {
-    var i = _i;
-    while (i < buf.len) : (i += 1) {
-        if (!@call(.always_inline, continue_pred, .{buf[i]})) {
-            return i;
-        }
-    }
-    return E;
-}
-
-/// Safely advance buffer index `i` by count
-///
-/// Returns `error.AdvanceBeyondBuffer` if i+count goes out of bounds
-inline fn advance(i: usize, count: usize, buf: []const u8, E: MWParser.ParseError) MWParser.ParseError!usize {
-    if (i + count < buf.len) {
-        return i + count;
-    } else {
-        return E;
-    }
-}
-
-inline fn isWhiteSpace(ch: u8) bool {
-    return ch == ' ' or ch == '\n' or ch == '\t' or ch == '\r';
-}
-
-/// true if `ch` is a printable ascii digit dec 48 <--> 57
-inline fn isDigit(ch: u8) bool {
-    return 48 <= ch and ch <= 57;
-}
-
-/// Must this tag be self closed?
-///
-/// Also checks if it supports `<tag_name>` syntax in addition to `<tag_name/>`
-inline fn forbiddenClosingTag(tag_name: []const u8) bool {
-    const forbiddenClosingTagNames = [_][]const u8{ "area", "base", "basefont", "br", "col", "frame", "hr", "img", "input", "isindex", "link", "meta", "param" };
-
-    for (forbiddenClosingTagNames) |fctn| {
-        if (std.mem.eql(u8, fctn, tag_name))
-            return true;
-    }
-
-    return false;
-}
-
-/// returns `E` if `ch` is `\n`
-inline fn errOnLineBreak(ch: u8, E: MWParser.ParseError) MWParser.ParseError!void {
-    if (ch == '\n')
-        return E;
 }
 
 /// returns `true` if the needle is present starting at i.
@@ -1207,831 +1063,58 @@ inline fn nextEqlCount(buf: []const u8, ch: u8, count: usize, _i: usize) bool {
     return false;
 }
 
-/// get 30 chars before problems and 30 chars after if buf allows
-inline fn getErrContext(buf: []const u8, i: usize) []const u8 {
-    const start = blk: {
-        if (i < 30)
-            break :blk 0;
-        break :blk i - 30;
-    };
-    const end = blk: {
-        if (i + 30 >= buf.len)
-            break :blk buf.len;
-        break :blk i + 30;
-    };
-    return buf[start..end];
+/// Safely advance buffer index `i` by count
+///
+/// Returns `error.AdvanceBeyondBuffer` if i+count goes out of bounds
+inline fn advance(i: usize, count: usize, buf: []const u8, E: Error) Error!usize {
+    if (i + count < buf.len) {
+        return i + count;
+    } else {
+        return E;
+    }
 }
 
+/// returns `E` if `ch` is `\n`
+inline fn errOnLineBreak(ch: u8, E: Error) Error!void {
+    if (ch == '\n')
+        return E;
+}
+
+/// Skips until `i` exceeds `buf.len` (returning `E`) or a character not in `continues` is found
+inline fn skipWhileOneOf(buf: []const u8, comptime continues: []const u8, i: usize, E: Error) Error!usize {
+    var _i = i;
+
+    while (_i < buf.len) : (_i += 1) {
+        var cont: bool = false;
+        inline for (continues) |c|
+            cont = cont or buf[_i] == c;
+        if (!cont)
+            return _i;
+    }
+
+    return E;
+}
+
+///////////////////////////////////////////////////////////////////////
+// Utility Tests.
+
 test "Trivial nextEql" {
-    const wikitext =
-        \\{{{arg}}
-        \\
-    ;
-    try std.testing.expect(nextEql(wikitext, "{{{", 0));
-    try std.testing.expect(nextEql(wikitext, "}}\n", 6));
-    try std.testing.expect(!nextEql(wikitext, "{{{", 7));
+    try std.testing.expect(nextEql("{{{arg}}\n", "{{{", 0));
+    try std.testing.expect(nextEql("{{{arg}}\n", "}}\n", 6));
+    try std.testing.expect(!nextEql("{{{arg}}\n", "{{{", 7));
 }
 
 test "Trivial nextEqlCount" {
-    const wikitext =
-        \\{{{arg}}
-        \\
-    ;
-    try std.testing.expect(nextEqlCount(wikitext, '{', 3, 0));
-    try std.testing.expect(nextEqlCount(wikitext, '}', 2, 6));
-    try std.testing.expect(!nextEqlCount(wikitext, '{', 3, 7));
+    try std.testing.expect(nextEqlCount("{{{arg}}\n", '{', 3, 0));
+    try std.testing.expect(nextEqlCount("{{{arg}}\n", '}', 2, 6));
+    try std.testing.expect(!nextEqlCount("{{{arg}}\n", '{', 3, 7));
     try std.testing.expect(!nextEqlCount("== Anarchism=\n", '=', 2, 12));
 }
 
-test "Errors on unclosed Argument" {
-    const wikitext =
-        \\{{{arg}}
-        \\
-    ;
+///////////////////////////////////////////////////////////////////////
+// Parser Tests.
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-
-    const e = wp.parse();
-    try std.testing.expectError(MWParser.ParseError.IncompleteArgument, e);
-}
-
-test "Parses Well Formed Argument With Some Text" {
-    const wikitext =
-        \\Blah Blah Text{{{arg}}}
-        \\Some more text
-        \\
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 3);
-
-    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[0]), "text");
-    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[1]), "argument");
-    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[2]), "text");
-
-    switch (wp.nodes.items[0]) {
-        .text => |text| try std.testing.expectEqualStrings("Blah Blah Text", text),
-        else => unreachable,
-    }
-
-    switch (wp.nodes.items[1]) {
-        .argument => |text| try std.testing.expectEqualStrings("{{{arg}}}", text),
-        else => unreachable,
-    }
-
-    switch (wp.nodes.items[2]) {
-        .text => |text| try std.testing.expectEqualStrings("\nSome more text\n", text),
-        else => unreachable,
-    }
-}
-
-test "HEADING rejects malformed headings" {
-    const unclosed1: []const u8 =
-        \\== Anarchism
-        \\
-    ;
-    const unclosed2: []const u8 =
-        \\== Anarchism=
-        \\
-    ;
-    // not considered an error anymore
-    //const overclosed: []const u8 =
-    //    \\== Anarchism===
-    //    \\
-    //;
-    const bad_line_break: []const u8 =
-        \\== Anarchism
-        \\==
-        \\
-    ;
-    const weird: []const u8 =
-        \\= = =
-        \\
-    ;
-    const cases = [_][]const u8{ unclosed1, unclosed2, bad_line_break, weird };
-
-    for (cases) |case| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        var wp = MWParser.init(a, case);
-        const e = wp.parse();
-        try std.testing.expectError(MWParser.ParseError.IncompleteHeading, e);
-    }
-}
-
-test "HEADING well formed with some text" {
-    const wikitext =
-        \\= Blah Blah Blah =
-        \\Blah Blah Blah
-        \\Some more Blah
-        \\
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 2);
-
-    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[0]), "heading");
-    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[1]), "text");
-
-    switch (wp.nodes.items[0]) {
-        .heading => |h| {
-            try std.testing.expectEqualStrings("Blah Blah Blah", h.heading);
-            try std.testing.expect(h.level == 1);
-        },
-        else => unreachable,
-    }
-
-    switch (wp.nodes.items[1]) {
-        .text => |text| try std.testing.expectEqualStrings("\nBlah Blah Blah\nSome more Blah\n", text),
-        else => unreachable,
-    }
-}
-
-test "HEADING embedded html with attributes" {
-    const wikitext =
-        \\=== Computing <span class="anchor" id="Computing codes"></span> ===
-        \\
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 2);
-
-    switch (wp.nodes.items[0]) {
-        .heading => |h| {
-            try std.testing.expect(h.level == 3);
-            try std.testing.expectEqualStrings("Computing <span class=\"anchor\" id=\"Computing codes\"></span>", h.heading);
-        },
-        else => unreachable,
-    }
-
-    switch (wp.nodes.items[1]) {
-        .text => |t| {
-            try std.testing.expectEqualStrings("\n", t);
-        },
-        else => unreachable,
-    }
-}
-
-test "HEADING parses correctly with following html comment" {
-    const wikitext = "===Molecular geometry===<!-- This section is linked from [[Nylon]] -->";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-    switch (wp.nodes.items[0]) {
-        .heading => |h| {
-            try std.testing.expect(h.level == 3);
-            try std.testing.expectEqualStrings("Molecular geometry", h.heading);
-        },
-        else => unreachable,
-    }
-}
-
-// TODO: The comment should be skipped, for now it goes into the heading text
-test "HEADING parses correctly with inline html comment" {
-    const wikitext = "==Scientific viewpoints<!--linked from 'Evolution of morality'-->==";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-    switch (wp.nodes.items[0]) {
-        .heading => |h| {
-            try std.testing.expect(h.level == 2);
-            try std.testing.expectEqualStrings("Scientific viewpoints<!--linked from 'Evolution of morality'-->", h.heading);
-        },
-        else => unreachable,
-    }
-}
-
-test "Rejects various malformed html entities" {
-    const non_numerical_num: []const u8 = "&#hello;";
-    const too_many_digits: []const u8 = "&#12345;";
-    const too_few_digits: []const u8 = "&#1;";
-    const unclosed: []const u8 = "&hello";
-
-    const cases = [_][]const u8{ non_numerical_num, too_many_digits, too_few_digits, unclosed };
-    for (cases) |case| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        var wp = MWParser.init(a, case);
-        const e = wp.parse();
-        try std.testing.expectError(MWParser.ParseError.IncompleteHtmlEntity, e);
-    }
-}
-
-test "Correctly Parses HTML Entity" {
-    const big_num: []const u8 = "&#1234;";
-    const sm_num: []const u8 = "&#11;";
-    const s_one: []const u8 = "&hello;";
-    const s_two: []const u8 = "&quot;";
-
-    const entities = [_][]const u8{ big_num, sm_num, s_one, s_two };
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, big_num ++ sm_num ++ s_one ++ s_two);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 4);
-    for (0..4) |i| {
-        switch (wp.nodes.items[i]) {
-            .html_entity => |he| try std.testing.expectEqualStrings(entities[i], he),
-            else => unreachable,
-        }
-    }
-}
-
-test "COMMENT fails on unclosed" {
-    const wikitext = "<!-- Blah --";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    const e = wp.parse();
-
-    try std.testing.expectError(MWParser.ParseError.UnclosedHtmlComment, e);
-}
-
-test "COMMENT correct" {
-    const wikitext = "<!-- Blah Blah -->";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 0);
-}
-
-test "COMMENT skips enclosed '-' and embedded tags" {
-    const wikitext =
-        \\<!--In aquatic amphibians, the liver plays only a small role in processing nitrogen for excretion, and [[ammonia]] is diffused mainly through the skin. The liver of terrestrial amphibians converts ammonia to urea, a less toxic, water-soluble nitrogenous compound, as a means of water conservation. In some species, urea is further converted into [[uric acid]]. [[Bile]] secretions from the liver collect in the gall bladder and flow into the small intestine. In the small intestine, enzymes digest carbohydrates, fats, and proteins. Salamanders lack a valve separating the small intestine from the large intestine. Salt and water absorption occur in the large intestine, as well as mucous secretion to aid in the transport of faecal matter, which is passed out through the [[cloaca]].<ref name="Anatomy" />---Omitting this until a more reliable source can be found.--->
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 0);
-}
-
-test "HEADING COMMENT well formed heading with some text and a comment" {
-    const wikitext =
-        \\= Blah Blah Blah =
-        \\Blah <!-- Blah Blah --> Blah Blah
-        \\Some more Blah
-        \\
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 3);
-
-    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[0]), "heading");
-    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[1]), "text");
-    try std.testing.expectEqualStrings(@tagName(wp.nodes.items[2]), "text");
-
-    switch (wp.nodes.items[0]) {
-        .heading => |h| {
-            try std.testing.expectEqualStrings("Blah Blah Blah", h.heading);
-            try std.testing.expect(h.level == 1);
-        },
-        else => unreachable,
-    }
-
-    switch (wp.nodes.items[1]) {
-        .text => |text| try std.testing.expectEqualStrings("\nBlah ", text),
-        else => unreachable,
-    }
-
-    switch (wp.nodes.items[2]) {
-        .text => |text| try std.testing.expectEqualStrings(" Blah Blah\nSome more Blah\n", text),
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG Trivial Correct" {
-    const wikitext = "<ref>Hello</ref>";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-
-    switch (wp.nodes.items[0]) {
-        .html_tag => |t| {
-            try std.testing.expectEqualStrings("ref", t.tag_name);
-            try std.testing.expect(t.children.len == 1);
-            switch (t.children.first.?.data) {
-                .text => |txt| try std.testing.expectEqualStrings("Hello", txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG Wierd Spacing" {
-    const case1: []const u8 = "<ref>Hello</ref>";
-    const case2: []const u8 =
-        \\<ref   >Hello</ref>
-    ;
-    const case3: []const u8 =
-        \\<ref   >Hello</ref   >
-    ;
-    const case4: []const u8 =
-        \\<ref   
-        \\  >Hello</ref   
-        \\>
-    ;
-    const case5: []const u8 =
-        \\<ref       
-        \\  >Hello</ref   
-        \\>
-    ;
-
-    const cases = [_][]const u8{ case1, case2, case3, case4, case5 };
-
-    for (cases) |case| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-
-        var wp = MWParser.init(a, case);
-        try wp.parse();
-
-        try std.testing.expect(wp.nodes.items.len == 1);
-
-        switch (wp.nodes.items[0]) {
-            .html_tag => |t| {
-                try std.testing.expectEqualStrings("ref", t.tag_name);
-                try std.testing.expect(t.children.len == 1);
-                switch (t.children.first.?.data) {
-                    .text => |txt| try std.testing.expectEqualStrings("Hello", txt),
-                    else => unreachable,
-                }
-            },
-            else => unreachable,
-        }
-    }
-}
-
-test "HTML_TAG decodes attributes correctly" {
-    const wikitext = "<ref kind='web'>citation</ref>";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    switch (wp.nodes.items[0]) {
-        .html_tag => |t| {
-            try std.testing.expect(t.attrs.len == 1);
-            try std.testing.expectEqualStrings("kind", t.attrs.first.?.data.name);
-            try std.testing.expectEqualStrings("web", t.attrs.first.?.data.value);
-            try std.testing.expectEqualStrings("ref", t.tag_name);
-            try std.testing.expect(t.children.len == 1);
-            switch (t.children.first.?.data) {
-                .text => |txt| try std.testing.expectEqualStrings("citation", txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG decodes attribute without quotes" {
-    const wikitext = "<ref name=Maine />";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    switch (wp.nodes.items[0]) {
-        .html_tag => |t| {
-            try std.testing.expect(t.attrs.len == 1);
-            try std.testing.expect(t.children.len == 0);
-            try std.testing.expectEqualStrings("name", t.attrs.first.?.data.name);
-            try std.testing.expectEqualStrings("Maine", t.attrs.first.?.data.value);
-            try std.testing.expectEqualStrings("ref", t.tag_name);
-        },
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG decodes with nested comment" {
-    const wikitext = "<ref kind='web'>cit<!-- Skip Me -->ation</ref>";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    switch (wp.nodes.items[0]) {
-        .html_tag => |t| {
-            try std.testing.expect(t.attrs.len == 1);
-            try std.testing.expectEqualStrings("kind", t.attrs.first.?.data.name);
-            try std.testing.expectEqualStrings("web", t.attrs.first.?.data.value);
-            try std.testing.expectEqualStrings("ref", t.tag_name);
-            try std.testing.expect(t.children.len == 2);
-            switch (t.children.first.?.data) {
-                .text => |txt| try std.testing.expectEqualStrings("cit", txt),
-                else => unreachable,
-            }
-            switch (t.children.first.?.next.?.data) {
-                .text => |txt| try std.testing.expectEqualStrings("ation", txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG decodes nested tags" {
-    const wikitext = "<div>Start<div>Middle</div>End</div>";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-
-    switch (wp.nodes.items[0]) {
-        .html_tag => |t| {
-            try std.testing.expect(t.attrs.len == 0);
-            try std.testing.expectEqualStrings("div", t.tag_name);
-            try std.testing.expect(t.children.len == 3);
-
-            var n = t.children.first.?;
-            switch (n.*.data) {
-                .text => |txt| try std.testing.expectEqualStrings("Start", txt),
-                else => unreachable,
-            }
-            n = n.next.?;
-            switch (n.*.data) {
-                .html_tag => |_t| {
-                    try std.testing.expectEqualStrings("div", _t.tag_name);
-                    try std.testing.expect(_t.attrs.len == 0);
-                    try std.testing.expect(_t.children.len == 1);
-                    switch (_t.children.first.?.data) {
-                        .text => |txt| try std.testing.expectEqualStrings("Middle", txt),
-                        else => unreachable,
-                    }
-                },
-                else => unreachable,
-            }
-            n = n.next.?;
-            switch (n.*.data) {
-                .text => |txt| try std.testing.expectEqualStrings("End", txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG decodes wrapped template" {
-    const wikitext =
-        \\<div>
-        \\{{Anarchism sidebar}}
-        \\</div>
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-}
-
-test "HTML_TAG <math> ignores '{' and '}'" {
-    const wikitext =
-        \\<math display="block">F = \frac{MS_\text{Treatments}}{MS_\text{Error}} = {{SS_\text{Treatments} / (I-1)} \over {SS_\text{Error} / (n_T-I)}}</math
-        \\>
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    switch (wp.nodes.items[0]) {
-        .html_tag => |ht| {
-            const c1 = ht.children.first.?.data;
-            switch (c1) {
-                .text => |txt| try std.testing.expectEqualStrings(
-                    \\F = \frac{MS_\text{Treatments}}{MS_\text{Error}} = {{SS_\text{Treatments} / (I-1)} \over {SS_\text{Error} / (n_T-I)}}
-                , txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG <math> ignores '<'" {
-    const wikitext =
-        \\<math>\hat{\sigma}_\text{OC} < 0.1</math>
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    switch (wp.nodes.items[0]) {
-        .html_tag => |ht| {
-            const c1 = ht.children.first.?.data;
-            switch (c1) {
-                .text => |txt| try std.testing.expectEqualStrings(
-                    \\\hat{\sigma}_\text{OC} < 0.1
-                , txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG nowiki is respected" {
-    const wikitext =
-        \\<nowiki> "#$%&'()*+,-./0123456789:;<=>?</nowiki>
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    switch (wp.nodes.items[0]) {
-        .html_tag => |ht| {
-            const c1 = ht.children.first.?.data;
-            switch (c1) {
-                .text => |txt| try std.testing.expectEqualStrings(
-                    \\ "#$%&'()*+,-./0123456789:;<=>?
-                , txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "HTML_TAG br, hr must be self closed" {
-    const wikitextPass = "<br ><br /><br name='hi'><hr>";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitextPass);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 4);
-
-    switch (wp.nodes.items[2]) {
-        .html_tag => |ht| {
-            try std.testing.expect(ht.attrs.len == 1);
-            const a1 = ht.attrs.first.?.data;
-            try std.testing.expectEqualStrings("name", a1.name);
-            try std.testing.expectEqualStrings("hi", a1.value);
-        },
-        else => unreachable,
-    }
-}
-
-test "EXTERNAL_LINK no title" {
-    const wikitext = "[https://example.com]";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-    switch (wp.nodes.items[0]) {
-        .external_link => |el| {
-            try std.testing.expect(el.title == null);
-            try std.testing.expectEqualStrings("https://example.com", el.url);
-        },
-        else => unreachable,
-    }
-}
-
-test "EXTERNAL_LINK title" {
-    const wikitext = "[http://dwardmac.pitzer.edu Anarchy Archives]";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-    switch (wp.nodes.items[0]) {
-        .external_link => |el| {
-            try std.testing.expectEqualStrings("http://dwardmac.pitzer.edu", el.url);
-            try std.testing.expectEqualStrings("Anarchy Archives", el.title.?);
-        },
-        else => unreachable,
-    }
-}
-
-test "WIKILINK no title" {
-    const wikitext = "[[Index of Andorra-related articles]]";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-    switch (wp.nodes.items[0]) {
-        .wiki_link => |wl| {
-            try std.testing.expectEqualStrings("Index of Andorra-related articles", wl.article);
-        },
-        else => unreachable,
-    }
-}
-
-test "WIKILINK title" {
-    const wikitext = "[[Andorra–Spain border|Spanish border]]";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-    switch (wp.nodes.items[0]) {
-        .wiki_link => |wl| {
-            try std.testing.expectEqualStrings("Andorra–Spain border", wl.article);
-            try std.testing.expect(wl.args.len == 1);
-            const arg1 = wl.args.first.?.data;
-            try std.testing.expect(arg1.values.len == 1);
-            switch (arg1.values.first.?.data) {
-                .text => |t| try std.testing.expectEqualStrings("Spanish border", t),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "WIKILINK wikitionary namespace" {
-    const wikitext = "[[wikt:phantasm|phantasm]]";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    switch (wp.nodes.items[0]) {
-        .wiki_link => |wl| {
-            try std.testing.expect(wl.namespace == .Wikitionary);
-            try std.testing.expectEqualStrings("phantasm", wl.article);
-        },
-        else => unreachable,
-    }
-}
-
-test "WIKILINK image multiple args" {
-    const wikitext = "[[File:Paolo Monti - Servizio fotografico (Napoli, 1969) - BEIC 6353768.jpg|thumb|upright=.7|[[Zeno of Citium]] ({{Circa|334|262 BC}}), whose *[[Republic (Zeno)|Republic]]* inspired [[Peter Kropotkin]]{{Sfn|Marshall|1993|p=70}}]]";
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-
-    try std.testing.expect(wp.nodes.items.len == 1);
-    switch (wp.nodes.items[0]) {
-        .wiki_link => |wl| {
-            try std.testing.expect(wl.namespace == .File);
-            try std.testing.expectEqualStrings("Paolo Monti - Servizio fotografico (Napoli, 1969) - BEIC 6353768.jpg", wl.article);
-            try std.testing.expect(wl.args.len == 3);
-
-            const arg1 = wl.args.first.?;
-            const arg1Values = arg1.data.values;
-            switch (arg1Values.first.?.data) {
-                .text => |txt| try std.testing.expectEqualStrings("thumb", txt),
-                else => unreachable,
-            }
-
-            const arg2 = arg1.next.?;
-            try std.testing.expectEqualStrings("upright", arg2.data.name.?);
-            const arg2Values = arg2.data.values;
-            switch (arg2Values.first.?.data) {
-                .text => |txt| try std.testing.expectEqualStrings(".7", txt),
-                else => unreachable,
-            }
-
-            const arg3 = arg2.next.?;
-            const arg3Value1 = arg3.data.values.first.?;
-            switch (arg3Value1.data) {
-                .wiki_link => |_wl| try std.testing.expectEqualStrings("Zeno of Citium", _wl.article),
-                else => unreachable,
-            }
-            const arg3Value2 = arg3Value1.next.?;
-            switch (arg3Value2.data) {
-                .text => |txt| try std.testing.expectEqualStrings(" (", txt),
-                else => unreachable,
-            }
-            const arg3Value3 = arg3Value2.next.?;
-            switch (arg3Value3.data) {
-                .template => |tmpl| {
-                    try std.testing.expectEqualStrings("Circa", tmpl.name);
-                    try std.testing.expect(tmpl.args.len == 2);
-                },
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
-}
-
-test "Skips Table" {
+test "TABLE skips" {
     const wikitext =
         \\Very Nice Table!
         \\{|class="wikitable" style="border: none; background: none; float: right;"
@@ -2056,20 +1139,139 @@ test "Skips Table" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
+    const doc = try parseDocument(a, wikitext);
 
-    try std.testing.expect(wp.nodes.items.len == 2);
+    try std.testing.expect(doc.n_children == 2);
 
-    switch (wp.nodes.items[0]) {
+    switch (doc.first_child.?.n) {
         .text => |t| try std.testing.expectEqualStrings("Very Nice Table!\n", t),
         else => unreachable,
     }
 
-    switch (wp.nodes.items[1]) {
+    switch (doc.last_child.?.n) {
         .text => |t| try std.testing.expectEqualStrings("\nGlad the table is over!", t),
         else => unreachable,
     }
+}
+
+test "COMMENT fails on unclosed" {
+    const wikitext = "<!-- Blah --";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const e = parseDocument(a, wikitext);
+
+    try std.testing.expectError(Error.UnclosedHtmlComment, e);
+}
+
+test "COMMENT correct" {
+    const wikitext = "<!-- Blah Blah -->";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 0);
+}
+
+test "COMMENT skips enclosed '-' and embedded tags" {
+    const wikitext =
+        \\<!--In aquatic amphibians, the liver plays only a small role in processing nitrogen for excretion, and [[ammonia]] is diffused mainly through the skin. The liver of terrestrial amphibians converts ammonia to urea, a less toxic, water-soluble nitrogenous compound, as a means of water conservation. In some species, urea is further converted into [[uric acid]]. [[Bile]] secretions from the liver collect in the gall bladder and flow into the small intestine. In the small intestine, enzymes digest carbohydrates, fats, and proteins. Salamanders lack a valve separating the small intestine from the large intestine. Salt and water absorption occur in the large intestine, as well as mucous secretion to aid in the transport of faecal matter, which is passed out through the [[cloaca]].<ref name="Anatomy" />---Omitting this until a more reliable source can be found.--->
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 0);
+}
+
+test "HTML_ENTITY fails over malformed" {
+    const non_numerical_num: []const u8 = "&#hello;";
+    const too_many_digits: []const u8 = "&#12345;";
+    const too_few_digits: []const u8 = "&#1;";
+    const unclosed: []const u8 = "&hello";
+
+    const cases = [_][]const u8{ non_numerical_num, too_many_digits, too_few_digits, unclosed };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const doc = try parseDocument(a, case);
+        try std.testing.expect(doc.n_children == 1);
+        //try std.testing.expect(doc.first_child.?.nodeType() == .text);
+    }
+}
+
+test "HTML_ENTITY correct parse" {
+    const big_num: []const u8 = "&#1234;";
+    const sm_num: []const u8 = "&#11;";
+    const hex_num: []const u8 = "&#x20;";
+    const s_one: []const u8 = "&hello;";
+    const s_two: []const u8 = "&quot;";
+
+    const entities = [_][]const u8{ big_num, sm_num, hex_num, s_one, s_two };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, big_num ++ sm_num ++ hex_num ++ s_one ++ s_two);
+
+    try std.testing.expect(doc.n_children == entities.len);
+
+    var child_it = doc.first_child.?;
+    for (0..entities.len) |i| {
+        try std.testing.expect(child_it.nodeType() == .html_entity);
+        switch (child_it.n) {
+            .html_entity => |he| try std.testing.expectEqualStrings(entities[i], he),
+            else => unreachable,
+        }
+        if (child_it.next) |next|
+            child_it = next;
+    }
+}
+
+test "EXTERNAL_LINK no title" {
+    const wikitext = "[https://example.com]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const el_node = doc.firstNode(.external_link).?;
+    const el_data = try el_node.asExternalLink();
+
+    try std.testing.expect(el_data.title == null);
+    try std.testing.expectEqualStrings("https://example.com", el_data.url);
+}
+
+test "EXTERNAL_LINK title" {
+    const wikitext = "[http://dwardmac.pitzer.edu Anarchy Archives]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const el_node = doc.firstNode(.external_link).?;
+    const el_data = try el_node.asExternalLink();
+    try std.testing.expectEqualStrings("http://dwardmac.pitzer.edu", el_data.url);
+    try std.testing.expectEqualStrings("Anarchy Archives", el_data.title.?);
 }
 
 test "TEMPLATE no args" {
@@ -2079,18 +1281,13 @@ test "TEMPLATE no args" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
+    const doc = try parseDocument(a, wikitext);
 
-    try std.testing.expect(wp.nodes.items.len == 1);
+    try std.testing.expect(doc.n_children == 1);
 
-    switch (wp.nodes.items[0]) {
-        .template => |t| {
-            try std.testing.expectEqualStrings("Anarchism sidebar", t.name);
-            try std.testing.expect(t.args.len == 0);
-        },
-        else => unreachable,
-    }
+    const template_node = doc.firstNode(.template).?;
+    try std.testing.expect(template_node.n_children == 0);
+    try std.testing.expectEqualStrings("Anarchism sidebar", (try template_node.asTemplate()).name);
 }
 
 test "TEMPLATE text argument no name" {
@@ -2100,25 +1297,19 @@ test "TEMPLATE text argument no name" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
+    const doc = try parseDocument(a, wikitext);
 
-    try std.testing.expect(wp.nodes.items.len == 1);
+    try std.testing.expect(doc.n_children == 1);
 
-    switch (wp.nodes.items[0]) {
-        .template => |temp| {
-            try std.testing.expectEqualStrings("Main", temp.name);
-            try std.testing.expect(temp.args.len == 1);
-            const arg1 = temp.args.first.?.data;
-            try std.testing.expect(arg1.name == null);
-            const arg1_value1 = arg1.values.first.?.data;
-            switch (arg1_value1) {
-                .text => |txt| try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
+    const template_node = doc.firstNode(.template).?;
+    try std.testing.expect(template_node.n_children == 1);
+    try std.testing.expectEqualStrings("Main", (try template_node.asTemplate()).name);
+
+    const arg_node = template_node.firstNode(.argument).?;
+    try std.testing.expect((try arg_node.asArg()).key == null);
+
+    const arg_text_value = arg_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", try arg_text_value.asText());
 }
 
 test "TEMPLATE child as arg" {
@@ -2128,31 +1319,20 @@ test "TEMPLATE child as arg" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
+    const doc = try parseDocument(a, wikitext);
 
-    try std.testing.expect(wp.nodes.items.len == 1);
+    try std.testing.expect(doc.n_children == 1);
 
-    switch (wp.nodes.items[0]) {
-        .template => |t| {
-            try std.testing.expectEqualStrings("Main", t.name);
-            try std.testing.expect(t.args.len == 1);
+    const template_node = doc.firstNode(.template).?;
+    try std.testing.expect(template_node.n_children == 1);
+    try std.testing.expectEqualStrings("Main", (try template_node.asTemplate()).name);
 
-            const arg1 = t.args.first.?.data;
-            try std.testing.expect(arg1.name == null);
-            try std.testing.expect(arg1.values.len == 1);
+    const arg_node = template_node.firstNode(.argument).?;
+    try std.testing.expect((try arg_node.asArg()).key == null);
 
-            const arg1_value1 = arg1.values.first.?.data;
-            switch (arg1_value1) {
-                .template => |tmpl| {
-                    try std.testing.expect(tmpl.args.len == 0);
-                    try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", tmpl.name);
-                },
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
+    const nested_template_node = arg_node.firstNode(.template).?;
+    const nested_template_data = try nested_template_node.asTemplate();
+    try std.testing.expectEqualStrings("Definition of anarchism and libertarianism", nested_template_data.name);
 }
 
 test "TEMPLATE parses with KV arg" {
@@ -2162,28 +1342,42 @@ test "TEMPLATE parses with KV arg" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
+    const doc = try parseDocument(a, wikitext);
 
-    try std.testing.expect(wp.nodes.items.len == 1);
+    try std.testing.expect(doc.n_children == 1);
 
-    switch (wp.nodes.items[0]) {
-        .template => |t| {
-            try std.testing.expectEqualStrings("Main", t.name);
-            try std.testing.expect(t.args.len == 1);
+    const template_node = doc.firstNode(.template).?;
+    try std.testing.expect(template_node.n_children == 1);
+    try std.testing.expectEqualStrings("Main", (try template_node.asTemplate()).name);
 
-            const arg1 = t.args.first.?.data;
-            try std.testing.expectEqualStrings("date", arg1.name.?);
-            try std.testing.expect(arg1.values.len == 1);
+    const arg_node = template_node.firstNode(.argument).?;
+    try std.testing.expectEqualStrings("date", (try arg_node.asArg()).key.?);
 
-            const arg1_value1 = arg1.values.first.?.data;
-            switch (arg1_value1) {
-                .text => |txt| try std.testing.expectEqualStrings("May 2023", txt),
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
+    const text_arg_value_node = arg_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("May 2023", try text_arg_value_node.asText());
+}
+
+test "TEMPLATE doi link is escaped from parsing" {
+    const wikitext =
+        \\<ref name="Winston">{{cite journal| first=Jay |last=Winston |title=The Annual Course of Zonal Mean Albedo as Derived From ESSA 3 and 5 Digitized Picture Data |journal=Monthly Weather Review |volume=99 |pages=818–827| bibcode=1971MWRv...99..818W| date=1971| doi=10.1175/1520-0493(1971)099<0818:TACOZM>2.3.CO;2| issue=11|doi-access=free}}</ref>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    try std.testing.expect(html_tag_node.n_children == 1);
+
+    const template_node = html_tag_node.firstNode(.template).?;
+    const template_node_name = (try template_node.asTemplate()).name;
+    try std.testing.expectEqualStrings("cite journal", template_node_name);
+
+    const doi_arg_node = (try template_node.getArgByKey("doi")).?;
+    const doi_text_node = doi_arg_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("10.1175/1520-0493(1971)099<0818:TACOZM>2.3.CO;2", try doi_text_node.asText());
 }
 
 test "TEMPLATE html comment ends KV arg" {
@@ -2198,66 +1392,25 @@ test "TEMPLATE html comment ends KV arg" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
+    const doc = try parseDocument(a, wikitext);
 
-    try std.testing.expect(wp.nodes.items.len == 1);
+    try std.testing.expect(doc.n_children == 1);
 
-    switch (wp.nodes.items[0]) {
-        .template => |tmpl| {
-            try std.testing.expect(tmpl.args.len == 3);
+    const tmpl_node = doc.firstNode(.template).?;
+    const bird_arg_node = (try tmpl_node.getArgByKey("bird")).?;
+    try std.testing.expect(bird_arg_node.n_children == 3);
+    try std.testing.expectEqualStrings("bird", (try bird_arg_node.asArg()).key.?);
 
-            const arg2 = tmpl.args.first.?.next.?;
-            try std.testing.expectEqualStrings("bird", arg2.data.name.?);
-            try std.testing.expect(arg2.data.values.len == 5);
+    const bird_arg_value1 = bird_arg_node.first_child.?;
+    try std.testing.expectEqualStrings("Northern flicker", (try bird_arg_value1.asWikiLink()).article);
 
-            const value1 = arg2.data.values.first.?;
-            switch (value1.data) {
-                .text => |txt| try std.testing.expectEqualStrings(" ", txt),
-                else => unreachable,
-            }
+    const bird_arg_value2 = bird_arg_value1.next.?;
+    try std.testing.expectEqualStrings(", ", try bird_arg_value2.asText());
 
-            const value2 = value1.next.?;
-            switch (value2.data) {
-                .wiki_link => |wl_ctx| {
-                    try std.testing.expectEqualStrings("Northern flicker", wl_ctx.article);
-                    try std.testing.expect(wl_ctx.args.len == 1);
-                    switch (wl_ctx.args.first.?.data.values.first.?.data) {
-                        .text => |txt| try std.testing.expectEqualStrings("Yellowhammer", txt),
-                        else => unreachable,
-                    }
-                },
-                else => unreachable,
-            }
-
-            const value4 = value2.next.?.next.?;
-            switch (value4.data) {
-                .wiki_link => |wl_ctx| {
-                    try std.testing.expectEqualStrings("wild turkey", wl_ctx.article);
-                    try std.testing.expect(wl_ctx.args.len == 0);
-                },
-                else => unreachable,
-            }
-        },
-        else => unreachable,
-    }
+    const bird_arg_value3 = bird_arg_value2.next.?;
+    try std.testing.expectEqualStrings("wild turkey", (try bird_arg_value3.asWikiLink()).article);
 }
 
-test "TEMPLATE doi link is escaped from parsing" {
-    const wikitext =
-        \\<ref name="Winston">{{cite journal| first=Jay |last=Winston |title=The Annual Course of Zonal Mean Albedo as Derived From ESSA 3 and 5 Digitized Picture Data |journal=Monthly Weather Review |volume=99 |pages=818–827| bibcode=1971MWRv...99..818W| date=1971| doi=10.1175/1520-0493(1971)099<0818:TACOZM>2.3.CO;2| issue=11|doi-access=free}}</ref>"
-    ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
-}
-
-// TODO: grab html entity
-// trim text
 test "TEMPLATE '[' treated as text" {
     const wikitext = "{{cite web |url=http://lcweb2.loc.gov/diglib/ihas/loc.natlib.ihas.100010615/full.html |title=Materna (O Mother Dear, Jerusalem) / Samuel Augustus Ward [hymnal&#93;: Print Material Full Description: Performing Arts Encyclopedia, Library of Congress |publisher=Lcweb2.loc.gov |date=2007-10-30 |access-date=2011-08-20 |url-status=live |archive-url=https://web.archive.org/web/20110605020952/http://lcweb2.loc.gov/diglib/ihas/loc.natlib.ihas.100010615/full.html |archive-date=June 5, 2011}}";
 
@@ -2265,21 +1418,489 @@ test "TEMPLATE '[' treated as text" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
+    const doc = try parseDocument(a, wikitext);
+    try std.testing.expect(doc.n_children == 1);
 
-    try std.testing.expect(wp.nodes.items.len == 1);
-    switch (wp.nodes.items[0]) {
-        .template => |tmpl| {
-            const arg2 = tmpl.args.first.?.next.?.data;
-            const arg2Value1 = arg2.values.first.?.data;
-            switch (arg2Value1) {
-                .text => |txt| try std.testing.expectEqualStrings("Materna (O Mother Dear, Jerusalem) / Samuel Augustus Ward [hymnal&#93;: Print Material Full Description: Performing Arts Encyclopedia, Library of Congress ", txt),
-                else => unreachable,
-            }
+    const tmpl_node = doc.firstNode(.template).?;
+    const title_arg_node = (try tmpl_node.getArgByKey("title")).?;
+    try std.testing.expect(title_arg_node.n_children == 3);
+    const title_text_node = title_arg_node.first_child.?;
+    try std.testing.expectEqualStrings("Materna (O Mother Dear, Jerusalem) / Samuel Augustus Ward [hymnal", try title_text_node.asText());
+
+    const title_entity_node = title_text_node.next.?;
+    try std.testing.expectEqualStrings("&#93;", try title_entity_node.asHtmlEntity());
+
+    const title_text_node2 = title_entity_node.next.?;
+    try std.testing.expectEqualStrings(": Print Material Full Description: Performing Arts Encyclopedia, Library of Congress ", try title_text_node2.asText());
+}
+
+test "WIKILINK no title" {
+    const wikitext = "[[Index of Andorra-related articles]]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+    try std.testing.expect(doc.n_children == 1);
+
+    switch (doc.first_child.?.n) {
+        .wiki_link => |wl| {
+            try std.testing.expectEqualStrings("Index of Andorra-related articles", wl.article);
         },
         else => unreachable,
     }
+}
+
+test "WIKILINK title" {
+    const wikitext = "[[Andorra–Spain border|Spanish border]]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const link_node = doc.firstNode(.wiki_link).?;
+    const article = (try link_node.asWikiLink()).article;
+    try std.testing.expectEqualStrings("Andorra–Spain border", article);
+
+    const arg_node = link_node.firstNode(.argument).?;
+    const arg_value_text_node = arg_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("Spanish border", try arg_value_text_node.asText());
+}
+
+test "WIKILINK wikitionary namespace" {
+    const wikitext = "[[wikt:phantasm|phantasm]]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+    try std.testing.expect(doc.n_children == 1);
+
+    const link_node = doc.firstNode(.wiki_link).?;
+    const link_data = try link_node.asWikiLink();
+
+    try std.testing.expect(link_data.namespace == .Wikitionary);
+    try std.testing.expectEqualStrings("phantasm", link_data.article);
+}
+
+test "WIKILINK image multiple args" {
+    const wikitext = "[[File:Paolo Monti - Servizio fotografico (Napoli, 1969) - BEIC 6353768.jpg|thumb|upright=.7|[[Zeno of Citium]] ({{Circa|334|262 BC}}), whose *[[Republic (Zeno)|Republic]]* inspired [[Peter Kropotkin]]{{Sfn|Marshall|1993|p=70}}]]";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const wl_node = doc.firstNode(.wiki_link).?;
+    const wl_data = try wl_node.asWikiLink();
+
+    try std.testing.expect(wl_data.namespace == .File);
+    try std.testing.expectEqualStrings("Paolo Monti - Servizio fotografico (Napoli, 1969) - BEIC 6353768.jpg", wl_data.article);
+    try std.testing.expect(wl_node.n_children == 3);
+
+    const arg1_node = wl_node.firstNode(.argument).?;
+    const arg1_text = arg1_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("thumb", try arg1_text.asText());
+
+    const arg2_node = arg1_node.next.?;
+    try std.testing.expect(arg2_node.nodeType() == .argument);
+    try std.testing.expectEqualStrings("upright", (try arg2_node.asArg()).key.?);
+    const arg2_text = arg2_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings(".7", try arg2_text.asText());
+
+    const arg3_node = arg2_node.next.?;
+    try std.testing.expect(arg2_node.nodeType() == .argument);
+    const arg3_wiki_link = arg3_node.firstNode(.wiki_link).?;
+    try std.testing.expectEqualStrings("Zeno of Citium", (try arg3_wiki_link.asWikiLink()).article);
+    const arg3_text = arg3_wiki_link.next.?;
+    try std.testing.expectEqualStrings(" (", try arg3_text.asText());
+    const arg3_template = arg3_text.next.?;
+    try std.testing.expectEqualStrings("Circa", (try arg3_template.asTemplate()).name);
+}
+
+test "HTML_TAG Trivial Correct" {
+    const wikitext = "<ref>Hello</ref>";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+    try std.testing.expect(doc.n_children == 1);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    const html_tag_data = try html_tag_node.asHtmlTag();
+    try std.testing.expectEqualStrings("ref", html_tag_data.tag_name);
+    try std.testing.expect(html_tag_node.n_children == 1);
+
+    const tag_text = html_tag_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("Hello", try tag_text.asText());
+}
+
+test "HTML_TAG Wierd Spacing" {
+    const case1: []const u8 = "<ref>Hello</ref>";
+    const case2: []const u8 =
+        \\<ref   >Hello</ref>
+    ;
+    const case3: []const u8 =
+        \\<ref   >Hello</ref   >
+    ;
+    const case4: []const u8 =
+        \\<ref
+        \\  >Hello</ref
+        \\>
+    ;
+    const case5: []const u8 =
+        \\<ref
+        \\  >Hello</ref
+        \\>
+    ;
+
+    const cases = [_][]const u8{ case1, case2, case3, case4, case5 };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const doc = try parseDocument(a, case);
+
+        try std.testing.expect(doc.n_children == 1);
+
+        const html_tag_node = doc.firstNode(.html_tag).?;
+        const html_tag_data = try html_tag_node.asHtmlTag();
+        try std.testing.expectEqualStrings("ref", html_tag_data.tag_name);
+        try std.testing.expect(html_tag_node.n_children == 1);
+
+        const tag_text = html_tag_node.firstNode(.text).?;
+        try std.testing.expectEqualStrings("Hello", try tag_text.asText());
+    }
+}
+
+test "HTML_TAG decodes attributes correctly" {
+    const wikitext = "<ref kind='web'>citation</ref>";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    const html_tag_data = try html_tag_node.asHtmlTag();
+    const tag_attrs = html_tag_data.attrs;
+
+    try std.testing.expect(tag_attrs.len == 1);
+    try std.testing.expectEqualStrings("kind", tag_attrs.first.?.data.name);
+    try std.testing.expectEqualStrings("web", tag_attrs.first.?.data.value);
+
+    const tag_text_node = html_tag_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("citation", try tag_text_node.asText());
+}
+
+test "HTML_TAG decodes attribute without quotes" {
+    const wikitext = "<ref name=Maine />";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    const html_tag_data = try html_tag_node.asHtmlTag();
+    try std.testing.expectEqualStrings("ref", html_tag_data.tag_name);
+    try std.testing.expect(html_tag_node.n_children == 0);
+
+    const tag_attrs = html_tag_data.attrs;
+    try std.testing.expect(tag_attrs.len == 1);
+    try std.testing.expectEqualStrings("name", tag_attrs.first.?.data.name);
+    try std.testing.expectEqualStrings("Maine", tag_attrs.first.?.data.value);
+}
+
+test "HTML_TAG decodes with nested comment" {
+    const wikitext = "<ref kind='web'>cit<!-- Skip Me -->ation</ref>";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+    try std.testing.expect(doc.n_children == 1);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    const html_tag_data = try html_tag_node.asHtmlTag();
+    try std.testing.expectEqualStrings("ref", html_tag_data.tag_name);
+    try std.testing.expect(html_tag_node.n_children == 2);
+
+    const tag_attrs = html_tag_data.attrs;
+    try std.testing.expect(tag_attrs.len == 1);
+    try std.testing.expectEqualStrings("kind", tag_attrs.first.?.data.name);
+    try std.testing.expectEqualStrings("web", tag_attrs.first.?.data.value);
+
+    const tag_text1 = html_tag_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("cit", try tag_text1.asText());
+
+    const tag_text2 = tag_text1.next.?;
+    try std.testing.expectEqualStrings("ation", try tag_text2.asText());
+}
+
+test "HTML_TAG decodes nested tags" {
+    const wikitext = "<div>Start<div>Middle</div>End</div>";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    const html_tag_data = try html_tag_node.asHtmlTag();
+    try std.testing.expectEqualStrings("div", html_tag_data.tag_name);
+    try std.testing.expect(html_tag_node.n_children == 3);
+
+    const tag_attrs = html_tag_data.attrs;
+    try std.testing.expect(tag_attrs.len == 0);
+
+    const start_text_node = html_tag_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("Start", try start_text_node.asText());
+
+    const nested_html_tag_node = start_text_node.next.?;
+    const nested_html_tag_data = try nested_html_tag_node.asHtmlTag();
+    try std.testing.expect(nested_html_tag_data.attrs.len == 0);
+    try std.testing.expect(nested_html_tag_node.n_children == 1);
+    try std.testing.expectEqualStrings("div", nested_html_tag_data.tag_name);
+    const nested_text = nested_html_tag_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings("Middle", try nested_text.asText());
+
+    const end_text_node = nested_html_tag_node.next.?;
+    try std.testing.expectEqualStrings("End", try end_text_node.asText());
+}
+
+test "HTML_TAG decodes wrapped template" {
+    const wikitext =
+        \\<div>
+        \\{{Anarchism sidebar}}
+        \\</div>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+    try std.testing.expect(doc.n_children == 1);
+}
+
+test "HTML_TAG <math> ignores '{' and '}'" {
+    const wikitext =
+        \\<math display="block">F = \frac{MS_\text{Treatments}}{MS_\text{Error}} = {{SS_\text{Treatments} / (I-1)} \over {SS_\text{Error} / (n_T-I)}}</math
+        \\>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    const tag_content = html_tag_node.firstNode(.text).?;
+    try std.testing.expectEqualStrings(
+        \\F = \frac{MS_\text{Treatments}}{MS_\text{Error}} = {{SS_\text{Treatments} / (I-1)} \over {SS_\text{Error} / (n_T-I)}}
+    , try tag_content.asText());
+}
+
+test "HTML_TAG <math> ignores '<'" {
+    const wikitext =
+        \\<math>\hat{\sigma}_\text{OC} < 0.1</math>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    const tag_content = html_tag_node.firstNode(.text).?;
+
+    try std.testing.expectEqualStrings(
+        \\\hat{\sigma}_\text{OC} < 0.1
+    , try tag_content.asText());
+}
+
+test "HTML_TAG nowiki is respected" {
+    const wikitext =
+        \\<nowiki> "#$%&'()*+,-./0123456789:;<=>?</nowiki>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    const html_tag_node = doc.firstNode(.html_tag).?;
+    const tag_content = html_tag_node.firstNode(.text).?;
+
+    try std.testing.expectEqualStrings(
+        \\ "#$%&'()*+,-./0123456789:;<=>?
+    , try tag_content.asText());
+}
+
+test "HTML_TAG br, hr must be self closed" {
+    const wikitext = "<br ><br /><br name='hi'><hr>";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 4);
+}
+
+test "HEADING rejects malformed headings" {
+    const unclosed1: []const u8 =
+        \\== Anarchism
+        \\
+    ;
+    const unclosed2: []const u8 =
+        \\== Anarchism=
+        \\
+    ;
+    const bad_line_break: []const u8 =
+        \\== Anarchism
+        \\==
+        \\
+    ;
+    const cases = [_][]const u8{ unclosed1, unclosed2, bad_line_break };
+
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const e = parseDocument(a, case);
+        try std.testing.expectError(Error.IncompleteHeading, e);
+    }
+}
+
+test "HEADING well formed with some text" {
+    const wikitext =
+        \\= Blah Blah Blah =
+        \\Blah Blah Blah
+        \\Some more Blah
+        \\
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 2);
+
+    const heading_node = doc.first_child.?;
+    try std.testing.expect((try heading_node.asHeading()).level == 1);
+    const heading_text_node = heading_node.first_child.?;
+    try std.testing.expectEqualStrings("Blah Blah Blah", try heading_text_node.asText());
+
+    const text_node = heading_node.next.?;
+    try std.testing.expectEqualStrings("\nBlah Blah Blah\nSome more Blah\n", try text_node.asText());
+}
+
+test "HEADING embedded html with attributes" {
+    const wikitext =
+        \\=== Computing <span class="anchor" id="Computing codes"></span> ===
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const heading_node = doc.first_child.?;
+    try std.testing.expect((try heading_node.asHeading()).level == 3);
+
+    const heading_text_node = heading_node.first_child.?;
+    try std.testing.expectEqualStrings("Computing", try heading_text_node.asText());
+}
+
+test "HEADING parses correctly with following html comment" {
+    const wikitext = "===Molecular geometry===<!-- This section is linked from [[Nylon]] -->";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const heading_node = doc.first_child.?;
+    const heading_text_node = heading_node.first_child.?;
+    try std.testing.expectEqualStrings("Molecular geometry", try heading_text_node.asText());
+}
+
+test "HEADING parses correctly with inline html comment" {
+    const wikitext = "==Scientific viewpoints<!--linked from 'Evolution of morality'-->==";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 1);
+
+    const heading_node = doc.first_child.?;
+    const heading_text_node = heading_node.first_child.?;
+    try std.testing.expectEqualStrings("Scientific viewpoints", try heading_text_node.asText());
+}
+
+test "HEADING COMMENT well formed heading with some text and a comment" {
+    const wikitext =
+        \\= Blah Blah Blah =
+        \\Blah <!-- Blah Blah --> Blah Blah
+        \\Some more Blah
+        \\
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const doc = try parseDocument(a, wikitext);
+
+    try std.testing.expect(doc.n_children == 3);
+
+    const heading_node = doc.first_child.?;
+    try std.testing.expect((try heading_node.asHeading()).level == 1);
+    const heading_text_node = heading_node.first_child.?;
+    try std.testing.expectEqualStrings("Blah Blah Blah", try heading_text_node.asText());
+
+    const text_node1 = heading_node.next.?;
+    try std.testing.expectEqualStrings("\nBlah ", try text_node1.asText());
+
+    const text_node2 = text_node1.next.?;
+    try std.testing.expectEqualStrings(" Blah Blah\nSome more Blah\n", try text_node2.asText());
 }
 
 test "TEMPLATE large country infobox" {
@@ -2385,29 +2006,24 @@ test "TEMPLATE large country infobox" {
         \\| today                  =
         \\}}
     ;
-    const arg_names = [_][]const u8{ "conventional_long_name", "common_name", "native_name", "image_flag", "image_coat", "symbol_type", "national_motto", "national_anthem", "image_map", "map_caption", "image_map2", "capital", "coordinates", "largest_city", "official_languages", "ethnic_groups", "ethnic_groups_year", "religion", "religion_year", "religion_ref", "demonym", "government_type", "leader_title1", "leader_name1", "leader_title2", "leader_name2", "leader_title3", "leader_name3", "leader_title4", "leader_name4", "legislature", "sovereignty_type", "established_event1", "established_date1", "established_event2", "established_date2", "established_event3", "established_date3", "area_km2", "area_rank", "area_sq_mi", "percent_water", "population_estimate", "population_estimate_rank", "population_estimate_year", "population_census_year", "population_density_km2", "population_density_sq_mi", "population_density_rank", "GDP_PPP", "GDP_PPP_year", "GDP_PPP_rank", "GDP_PPP_per_capita", "GDP_PPP_per_capita_rank", "GDP_nominal", "GDP_nominal_year", "GDP_nominal_rank", "GDP_nominal_per_capita", "GDP_nominal_per_capita_rank", "Gini", "Gini_year", "Gini_ref", "HDI", "HDI_year", "HDI_change", "HDI_ref", "HDI_rank", "currency", "currency_code", "time_zone", "utc_offset", "utc_offset_DST", "time_zone_DST", "date_format", "drives_on", "calling_code", "cctld", "today" };
+    const arg_keys = [_][]const u8{ "conventional_long_name", "common_name", "native_name", "image_flag", "image_coat", "symbol_type", "national_motto", "national_anthem", "image_map", "map_caption", "image_map2", "capital", "coordinates", "largest_city", "official_languages", "ethnic_groups", "ethnic_groups_year", "religion", "religion_year", "religion_ref", "demonym", "government_type", "leader_title1", "leader_name1", "leader_title2", "leader_name2", "leader_title3", "leader_name3", "leader_title4", "leader_name4", "legislature", "sovereignty_type", "established_event1", "established_date1", "established_event2", "established_date2", "established_event3", "established_date3", "area_km2", "area_rank", "area_sq_mi", "percent_water", "population_estimate", "population_estimate_rank", "population_estimate_year", "population_census_year", "population_density_km2", "population_density_sq_mi", "population_density_rank", "GDP_PPP", "GDP_PPP_year", "GDP_PPP_rank", "GDP_PPP_per_capita", "GDP_PPP_per_capita_rank", "GDP_nominal", "GDP_nominal_year", "GDP_nominal_rank", "GDP_nominal_per_capita", "GDP_nominal_per_capita_rank", "Gini", "Gini_year", "Gini_ref", "HDI", "HDI_year", "HDI_change", "HDI_ref", "HDI_rank", "currency", "currency_code", "time_zone", "utc_offset", "utc_offset_DST", "time_zone_DST", "date_format", "drives_on", "calling_code", "cctld", "today" };
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    var wp = MWParser.init(a, wikitext);
-    try wp.parse();
+    const doc = try parseDocument(a, wikitext);
 
-    try std.testing.expect(wp.nodes.items.len == 1);
+    try std.testing.expect(doc.n_children == 1);
 
-    switch (wp.nodes.items[0]) {
-        .template => |tmpl| {
-            try std.testing.expect(tmpl.args.len == arg_names.len);
+    const template_node = doc.first_child.?;
+    try std.testing.expect(template_node.nodeType() == .template);
+    try std.testing.expect(template_node.n_children == arg_keys.len);
 
-            var it = tmpl.args.first;
-            var i: usize = 0;
-            while (it) |node| {
-                try std.testing.expectEqualStrings(arg_names[i], node.data.name.?);
-                it = node.next;
-                i += 1;
-            }
-        },
-        else => unreachable,
+    var i: usize = 0;
+    var it = template_node.first_child;
+    while (it) |node| : (it = node.next) {
+        try std.testing.expectEqualStrings(arg_keys[i], (try node.asArg()).key.?);
+        i += 1;
     }
 }
