@@ -415,6 +415,7 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8, t: anytype) !MWAstN
 /// `i` should point to the opening `<`
 fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.InvalidHtmlTag;
+    t.begin(start);
 
     const html_tag_node = try parent.createChildNode(.{ .html_tag = .{} });
     defer parent.appendChild(html_tag_node);
@@ -580,6 +581,8 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) 
 ///
 /// Tag end should have "</" prepended
 fn parseHtmlTagEscaped(html_tag_node: *MWAstNode, tag_end: []const u8, text: []const u8, pos: usize, E: Error, t: anytype) Error!usize {
+    t.begin(pos);
+
     const content_start = pos;
     var i = pos;
     while (i < text.len - tag_end.len) : (i += 1) {
@@ -601,6 +604,7 @@ fn parseHtmlTagEscaped(html_tag_node: *MWAstNode, tag_end: []const u8, text: []c
 
 fn parseWikiLink(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.BadWikiLink;
+    t.begin(start);
 
     const wiki_link_node = try parent.createChildNode(.{ .wiki_link = .{ .article = "" } });
     defer parent.appendChild(wiki_link_node);
@@ -654,6 +658,7 @@ fn parseWikiLink(parent: *MWAstNode, text: []const u8, start: usize, t: anytype)
 
 fn parseTemplate(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.BadTemplate;
+    t.begin(start);
 
     var i = start + "{{".len;
 
@@ -689,6 +694,7 @@ fn parseTemplate(parent: *MWAstNode, text: []const u8, start: usize, t: anytype)
 /// Parses template / wikilink argument with start pointing to the first character
 fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error, t: anytype) Error!struct { usize, bool } {
     std.debug.assert(parent.nodeType() == .wiki_link or parent.nodeType() == .template);
+    t.begin(start);
 
     var arg_node = try parent.createChildNode(.{ .argument = .{} });
     defer parent.appendChild(arg_node);
@@ -836,6 +842,7 @@ fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error, t
 
 fn parseExternalLink(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.BadExternalLink;
+    t.begin(start);
 
     // skip opening [
     var i = start + "[".len;
@@ -924,6 +931,7 @@ fn parseHtmlEntity(parent: *MWAstNode, text: []const u8, start: usize) Error!str
 
 fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.IncompleteHeading;
+    t.begin(start);
 
     const heading_node = try parent.createChildNode(.{ .heading = .{ .level = 0 } });
     defer parent.appendChild(heading_node);
@@ -992,6 +1000,8 @@ fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) 
 ///
 /// `pos` should point to the opening `{|`
 fn skipTable(text: []const u8, pos: usize, t: anytype) !usize {
+    t.begin(pos);
+
     var i = pos + "{|".len;
 
     while (i < text.len) {
@@ -1009,6 +1019,8 @@ fn skipTable(text: []const u8, pos: usize, t: anytype) !usize {
 ///
 /// `pos` should point to the first char of `<!--`
 fn skipHtmlComment(text: []const u8, pos: usize, t: anytype) !usize {
+    t.begin(pos);
+
     var i = pos + "<!--".len;
     while (i <= text.len - "-->".len) : (i += 1) {
         if (std.mem.eql(u8, text[i .. i + "-->".len], "-->"))

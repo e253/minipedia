@@ -14,7 +14,9 @@ WikiParseResult parsePage(const char* rawXmlEntry)
     try {
         doc.parse<rapidxml::parse_fastest>((char*)rawXmlEntry);
     } catch (const std::exception& e) {
+#ifdef WXMLP_LOG
         std::cout << log_prefix << "XML parse error: " << e.what() << std::endl;
+#endif
         return PARSE_PAGE_ERROR;
     }
 
@@ -32,7 +34,9 @@ WikiParseResult parsePage(const char* rawXmlEntry)
     // we only want 'mainspace' or ns='0' articles
     rapidxml::xml_node<>* namespaceNode = pageNode->first_node("ns");
     if (!namespaceNode) {
+#ifdef WXMLP_LOG
         std::cout << log_prefix << "No namespace found" << std::endl;
+#endif
         return PARSE_PAGE_ERROR;
     }
 
@@ -41,7 +45,9 @@ WikiParseResult parsePage(const char* rawXmlEntry)
     try {
         ns = std::stoi(namespace_string);
     } catch (const std::exception) {
+#ifdef WXMLP_LOG
         std::cout << log_prefix << "Namespace couldn't be parsed to uint8_t" << std::endl;
+#endif
     }
 
     rapidxml::xml_node<>* titleNode = pageNode->first_node("title");

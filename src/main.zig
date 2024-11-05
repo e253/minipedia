@@ -3,7 +3,7 @@ const wxmlp = @import("wikixmlparser.zig");
 const SliceArray = @import("slice_array.zig").SliceArray;
 const lzma = @import("lzma.zig");
 const mwp = @import("MediaWikiParser.zig");
-const StdoutTrace = @import("tracing.zig").StdoutTrace;
+const DuckTrace = @import("tracing.zig").DuckTrace;
 
 pub fn main() !void {
     const args = try Args.parse();
@@ -23,6 +23,9 @@ pub fn main() !void {
     defer std.heap.c_allocator.free(fbaBuffer);
     var fba = std.heap.FixedBufferAllocator.init(fbaBuffer);
     const fbaAlloc = fba.allocator();
+
+    // Initialize DuckDB tracing.
+    var duckTrace = try DuckTrace(mwp.Error).init("logs.db");
 
     // Write 15MB of 0s
     const tmp_zero_buf = try fbaAlloc.alloc(u8, 100_000);
@@ -69,7 +72,9 @@ pub fn main() !void {
         stats.total_article_bytes_read += wikiArticle.article.len;
 
         const preProcessedArticle = try preprocessArticle(alloc, wikiArticle.article);
-        const processedArticle = wikicodeToMarkdown(alloc, preProcessedArticle, document_id) catch blk: {
+
+        var duckTraceDocInstance = duckTrace.newInstance(document_id, preProcessedArticle);
+        const processedArticle = wikicodeToMarkdown(alloc, preProcessedArticle, &duckTraceDocInstance) catch blk: {
             stats.n_articles_failed_parsing += 1;
             break :blk preProcessedArticle;
         };
@@ -147,6 +152,8 @@ pub fn main() !void {
 
     stats.end_time_ms = std.time.milliTimestamp();
 
+    duckTrace.deinit();
+
     stats.toStdout();
 }
 
@@ -190,8 +197,9 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
 }
 
 /// Uses `mwp.parseDocument` to convert Wikicode AST to more concise and clean text
-fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8, doc_id: usize) ![]const u8 {
-    const doc = try mwp.parseDocument(a, raw_wikitext, StdoutTrace(mwp.Error){ .doc_id = doc_id });
+fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8, t: anytype) ![]const u8 {
+    const doc = try mwp.parseDocument(a, raw_wikitext, t);
+    try t.success();
     std.debug.assert(doc.n_children > 0);
     return raw_wikitext;
 }

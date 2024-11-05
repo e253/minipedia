@@ -67,7 +67,7 @@ pub fn parsePage(pageRawXml: []const u8) ?WikiArticle {
 }
 
 test "Simple Redirect No Content" {
-    try std.testing.expect(parsePage("<page> <redirect title=\"blah\" /> <revision><text>#REDIRECT=blah</text></revision> </page>") == null);
+    try std.testing.expect(parsePage("<page> <redirect title=\"blah\" /> <title>Redirect to blah</title> <ns>0</ns> <revision><text>#REDIRECT=blah</text></revision> </page>") == null);
 }
 
 test "Trivial Correct Page" {

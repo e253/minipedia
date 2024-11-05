@@ -12,12 +12,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe.addCSourceFile(.{ .file = b.path("src/wikixmlparser.cpp") });
+    exe.addCSourceFiles(.{ .root = b.path("src"), .files = &.{ "wikixmlparser.cpp", "duck_tracer.c" }, .flags = &.{"-DWXMLP_LOG"} });
     exe.addIncludePath(rxml.path(""));
     exe.addIncludePath(b.path("src"));
     exe.linkLibC();
     exe.linkLibCpp();
     exe.linkSystemLibrary("lzma");
+    exe.linkSystemLibrary("duckdb");
     b.installArtifact(exe);
 
     const get_article = b.addExecutable(.{
@@ -63,10 +64,21 @@ pub fn build(b: *std.Build) void {
     lzma_binding_tests.linkSystemLibrary("lzma");
     const run_lzma_binding_tests = b.addRunArtifact(lzma_binding_tests);
 
-    const test_step = b.step("test", "Run Unit Tests");
+    const mwp_tests = b.addTest(.{
+        .root_source_file = b.path("src/MediaWikiParser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_mwp_tests = b.addRunArtifact(mwp_tests);
+
+    const test_step = b.step("test", "Run All Unit Tests");
     test_step.dependOn(&run_wikiparserxml_tests.step);
     test_step.dependOn(&run_slice_array_tests.step);
     test_step.dependOn(&run_lzma_binding_tests.step);
+    test_step.dependOn(&run_mwp_tests.step);
+
+    const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
+    test_mwp_step.dependOn(&run_mwp_tests.step);
 }
 
 // liblzma static build on ice due to missing symbol problems
