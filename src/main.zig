@@ -2,14 +2,15 @@ const std = @import("std");
 const wxmlp = @import("wikixmlparser.zig");
 const SliceArray = @import("slice_array.zig").SliceArray;
 const lzma = @import("lzma.zig");
-const MWParser = @import("MediaWikiParser.zig").MWParser;
-
-pub const std_options = .{ .log_level = .debug };
+const mwp = @import("MediaWikiParser.zig");
+const StdoutTrace = @import("tracing.zig").StdoutTrace;
 
 pub fn main() !void {
     const args = try Args.parse();
 
-    const start_time = std.time.milliTimestamp();
+    var stats: Stats = .{
+        .start_time_ms = std.time.milliTimestamp(),
+    };
 
     var stdinBW = std.io.bufferedReader(std.io.getStdIn().reader());
     const stdin = stdinBW.reader();
@@ -31,14 +32,6 @@ pub fn main() !void {
     }
     fbaAlloc.free(tmp_zero_buf);
 
-    // Stats
-    var total_bytes_read: usize = 0;
-    var total_article_bytes_read: usize = 0;
-    var total_bytes_written: usize = 0;
-    const n_articles_to_process = args.n_articles_to_process;
-    var n_articles_processed: usize = 0;
-    var n_redirects_skipped: usize = 0;
-
     // Header
     var block_offsets = std.ArrayList(u64).init(std.heap.c_allocator);
     defer block_offsets.deinit();
@@ -55,7 +48,8 @@ pub fn main() !void {
     const lzma_block_out_buffer = try std.heap.c_allocator.alloc(u8, lzma_block_size_limit);
     defer std.heap.c_allocator.free(lzma_block_out_buffer);
 
-    while (true) {
+    var document_id: usize = 0;
+    while (document_id < args.n_articles_to_process) {
         var arena = std.heap.ArenaAllocator.init(fbaAlloc);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -65,34 +59,19 @@ pub fn main() !void {
             else => |e| return e,
         };
 
-        total_bytes_read += xmlPage.len;
+        stats.total_bytes_read += xmlPage.len;
 
         const wikiArticle = wxmlp.parsePage(xmlPage) orelse {
-            n_redirects_skipped += 1;
+            stats.n_redirects_skipped += 1;
             continue;
         };
 
-        total_article_bytes_read += wikiArticle.article.len;
+        stats.total_article_bytes_read += wikiArticle.article.len;
 
         const preProcessedArticle = try preprocessArticle(alloc, wikiArticle.article);
-        const processedArticle = blk: {
-            const PE = MWParser.ParseError;
-            break :blk wikicodeToMarkdown(alloc, preProcessedArticle) catch |err| switch (err) {
-                PE.BadExternalLink,
-                PE.BadTemplate,
-                PE.BadWikiLink,
-                PE.IncompleteArgument,
-                PE.IncompleteHeading,
-                PE.IncompleteHtmlEntity,
-                PE.IncompleteTable,
-                PE.InvalidHtmlTag,
-                PE.UnclosedHtmlComment,
-                => {
-                    std.log.warn("Article ID: {} ... {s}", .{ n_articles_processed, @errorName(err) });
-                    break :blk preProcessedArticle;
-                },
-                else => return err,
-            };
+        const processedArticle = wikicodeToMarkdown(alloc, preProcessedArticle, document_id) catch blk: {
+            stats.n_articles_failed_parsing += 1;
+            break :blk preProcessedArticle;
         };
 
         const size_to_write = processedArticle.len + wikiArticle.title.len + @sizeOf(usize) + "# ".len + "\n".len + "0".len;
@@ -111,14 +90,14 @@ pub fn main() !void {
 
             lzma_last_block_size = compressed_output.len;
             lzma_block_size = 0;
-            total_bytes_written += compressed_output.len;
+            stats.total_bytes_written += compressed_output.len;
             block_id += 1;
         }
 
         var accum_buffer_fbs = std.io.fixedBufferStream(lzma_block_accum_buffer[lzma_block_size..]);
         const accum_buffer_writer = accum_buffer_fbs.writer();
 
-        try accum_buffer_writer.writeInt(usize, n_articles_processed, .big);
+        try accum_buffer_writer.writeInt(usize, document_id, .big);
         try accum_buffer_writer.writeAll("# ");
         try accum_buffer_writer.writeAll(wikiArticle.title);
         try accum_buffer_writer.writeByte('\n');
@@ -130,17 +109,15 @@ pub fn main() !void {
         // Write down what block this article is in
         try article_id_block_id_map.append(block_id);
 
-        n_articles_processed += 1;
-        if (n_articles_processed == n_articles_to_process) {
-            break;
-        }
+        stats.n_articles_processed += 1;
+        document_id += 1;
     }
 
     if (lzma_block_size > 0) {
         const compressed_output = try lzma.compress(null, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
         try out.writeAll(compressed_output);
         lzma_block_size = 0;
-        total_bytes_written += compressed_output.len;
+        stats.total_bytes_written += compressed_output.len;
 
         if (block_offsets.items.len == 0) {
             try block_offsets.append(15_000_000);
@@ -168,21 +145,9 @@ pub fn main() !void {
     try prelude_out_writer.writeInt(u64, 0, .big); // Version
     try prelude_out_writer.writeInt(u64, header_start, .big); // Header Start
 
-    // Stats to stderr
-    std.debug.print("Read {d} MB. Avg article len {d} KB\n", .{
-        @as(f32, @floatFromInt(total_bytes_read)) / 1_000_000.0,
-        @as(f32, @floatFromInt(total_article_bytes_read)) / @as(f32, @floatFromInt(n_articles_to_process)) / 1_000.0,
-    });
-    std.debug.print("Wrote 15 + {d} MB. Avg article len {d} KB\n", .{
-        @as(f32, @floatFromInt(total_bytes_written)) / 1_000_000.0,
-        @as(f32, @floatFromInt(total_bytes_written)) / @as(f32, @floatFromInt(n_articles_to_process)) / 1_000.0,
-    });
-    std.debug.print("Processed {} articles, skipped {} articles\n", .{ n_articles_processed, n_redirects_skipped });
-    const end_time = std.time.milliTimestamp();
-    const t_in_s = @divFloor((end_time - start_time), 1000);
-    std.debug.print("{} min {} sec\n", .{ @divFloor(t_in_s, 60), @mod(t_in_s, 60) });
-    const articles_per_s = @as(f32, @floatFromInt(n_articles_processed)) / (@as(f32, @floatFromInt(end_time - start_time)) / 1000.0);
-    std.debug.print("{d} articles/s\n", .{articles_per_s});
+    stats.end_time_ms = std.time.milliTimestamp();
+
+    stats.toStdout();
 }
 
 /// Performs substitutions before wikitext can be parsed to an AST
@@ -224,12 +189,49 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
     return try sa.toSlice();
 }
 
-/// Uses `MWParser` to convert Wikicode AST to more concise and clean text
-fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8) ![]const u8 {
-    var wp = MWParser.init(a, raw_wikitext);
-    try wp.parse();
+/// Uses `mwp.parseDocument` to convert Wikicode AST to more concise and clean text
+fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8, doc_id: usize) ![]const u8 {
+    const doc = try mwp.parseDocument(a, raw_wikitext, StdoutTrace(mwp.Error){ .doc_id = doc_id });
+    std.debug.assert(doc.n_children > 0);
     return raw_wikitext;
 }
+
+pub const Stats = struct {
+    total_bytes_read: usize = 0,
+    total_article_bytes_read: usize = 0,
+    total_bytes_written: usize = 0,
+    n_articles_processed: usize = 0,
+    n_redirects_skipped: usize = 0,
+    n_articles_failed_parsing: usize = 0,
+    start_time_ms: i64 = 0,
+    end_time_ms: i64 = 0,
+
+    pub fn toStdout(this: *Stats) void {
+        const stdout = std.io.getStdOut().writer();
+
+        stdout.print("Processed {} articles, skipped {} redirects and {} parsing errors\n", .{ this.n_articles_processed, this.n_redirects_skipped, this.n_articles_failed_parsing }) catch unreachable;
+
+        stdout.print("Read {d} MB. Avg article len {d} KB\n", .{
+            tof32(this.total_bytes_read) / 1_000_000.0,
+            tof32(this.total_article_bytes_read) / tof32(this.n_articles_processed) / 1_000.0,
+        }) catch unreachable;
+
+        stdout.print("Wrote 15 (header) + {d} MB. Avg article len {d} KB\n", .{
+            tof32(this.total_bytes_written) / 1_000_000.0,
+            tof32(this.total_bytes_written) / tof32(this.n_articles_processed) / 1_000.0,
+        }) catch unreachable;
+
+        const t_in_s = @divFloor((this.end_time_ms - this.start_time_ms), 1000);
+        stdout.print("{} min {} sec\n", .{ @divFloor(t_in_s, 60), @mod(t_in_s, 60) }) catch unreachable;
+
+        const articles_per_s = tof32(this.n_articles_processed) / (tof32(this.end_time_ms - this.start_time_ms) / 1000.0);
+        stdout.print("{d} articles/s\n", .{articles_per_s}) catch unreachable;
+    }
+
+    inline fn tof32(in: anytype) f32 {
+        return @floatFromInt(in);
+    }
+};
 
 pub const Args = struct {
     n_articles_to_process: usize = std.math.maxInt(usize),

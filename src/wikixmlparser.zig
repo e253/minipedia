@@ -43,8 +43,6 @@ pub fn nextPageAlloc(a: std.mem.Allocator, reader: anytype) ![]const u8 {
 }
 
 const c = @cImport(@cInclude("wikixmlparser.h"));
-const WikiParseResult = c.WikiParseResult;
-const cParsePage = c.cParsePage;
 
 const WikiArticle = struct {
     title: []const u8,
@@ -54,16 +52,13 @@ const WikiArticle = struct {
 /// Extract page content if the page is not a redirect.
 /// Takes single <page></page> entry **null terminated**!
 pub fn parsePage(pageRawXml: []const u8) ?WikiArticle {
-    const cRes: WikiParseResult = cParsePage(pageRawXml.ptr);
-    if (cRes.article == null or cRes.article_title == null) {
-        // LOG THIS, error ocurred
+    const res: c.WikiParseResult = c.parsePage(pageRawXml.ptr);
+    if (res.article == null or res.article_title == null)
         return null;
-    }
-    if (cRes.is_redirect) {
+    if (res.is_redirect or res.ns != 0)
         return null;
-    }
-    const article: []const u8 = cRes.article[0..cRes.article_size];
-    const title: []const u8 = cRes.article_title[0..cRes.article_title_size];
+    const article: []const u8 = res.article[0..res.article_size];
+    const title: []const u8 = res.article_title[0..res.article_title_size];
 
     return .{
         .title = title,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestTrace = @import("tracing.zig").TestTrace;
 
 pub const ExternalLink = struct {
     url: []const u8,
@@ -264,21 +265,21 @@ pub const MWAstNode = struct {
     }
 };
 
-const Error = error{
+pub const Error = error{
     IncompleteArgument,
     IncompleteHeading,
     IncompleteHtmlEntity,
-    UnclosedHtmlComment,
     InvalidHtmlTag,
     InvalidMathTag,
     InvalidNoWikiTag,
-    SpuriousClosedHtmlTag,
     BadExternalLink,
     BadWikiLink,
-    IncompleteTable,
     BadTemplate,
     BadTemplateArg,
     BadWikiLinkArg,
+    IncompleteTable,
+    UnclosedHtmlComment,
+    SpuriousClosedHtmlTag,
 
     /// using `asText` on a template node
     InvalidDataCast,
@@ -286,7 +287,7 @@ const Error = error{
     OutOfMemory,
 };
 
-pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
+pub fn parseDocument(a: std.mem.Allocator, text: []const u8, t: anytype) !MWAstNode {
     var doc: MWAstNode = .{ .a = a };
 
     var i: usize = 0;
@@ -303,7 +304,7 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
                     // Template.
                     try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
 
-                    i = try parseTemplate(&doc, text, i);
+                    i = try parseTemplate(&doc, text, i, t);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -311,7 +312,7 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
                     // Table.
                     try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
 
-                    i = try skipTable(text, i);
+                    i = try skipTable(text, i, t);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -327,7 +328,7 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
                     // Wikilink.
                     try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
 
-                    i = try parseWikiLink(&doc, text, i);
+                    i = try parseWikiLink(&doc, text, i, t);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -335,7 +336,7 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
                     // External Link.
                     try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
 
-                    i = try parseExternalLink(&doc, text, i);
+                    i = try parseExternalLink(&doc, text, i, t);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -351,10 +352,10 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
 
                 if (nextEql(text, "!--", i + 1)) {
                     // HTML Comment.
-                    i = try skipHtmlComment(text, i);
+                    i = try skipHtmlComment(text, i, t);
                 } else {
                     // HTML Tag.
-                    i = try parseHtmlTag(&doc, text, i);
+                    i = try parseHtmlTag(&doc, text, i, t);
                 }
 
                 cur_text_node = text[i..];
@@ -384,7 +385,7 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
                 if (i == 0 or (i > 0 and text[i - 1] == '\n')) {
                     try createAndAppendTextNodeIfNotEmpty(&doc, cur_text_node);
 
-                    i = try parseHeading(&doc, text, i);
+                    i = try parseHeading(&doc, text, i, t);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -412,7 +413,7 @@ pub fn parseDocument(a: std.mem.Allocator, text: []const u8) !MWAstNode {
 // Node type specific parser functions.
 
 /// `i` should point to the opening `<`
-fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.InvalidHtmlTag;
 
     const html_tag_node = try parent.createChildNode(.{ .html_tag = .{} });
@@ -421,15 +422,15 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
     // Skip opening '<'.
     var i = try advance(start, "<".len, text, FAIL);
     if (std.ascii.isWhitespace(text[i]))
-        return FAIL;
+        return t.err(FAIL);
     if (text[i] == '/')
-        return Error.SpuriousClosedHtmlTag;
+        return t.err(Error.SpuriousClosedHtmlTag);
 
     // Find end of the tag name.
     const tag_name_start = i;
     i = try skipUntilOneOf(text, &.{ ' ', '\t', '\n', '/', '>' }, i, FAIL);
     if (i == tag_name_start)
-        return FAIL;
+        return t.err(FAIL);
     const tag_name = text[tag_name_start..i];
 
     // Skip whitespace after tag name.
@@ -439,13 +440,13 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
     var attrs = HtmlTag.AttrList{};
     while (std.mem.count(u8, " \n\t/>=", text[i .. i + 1]) == 0) {
         if (i >= text.len)
-            return FAIL;
+            return t.err(FAIL);
 
         // Attribute name.
         const attr_name_start = i;
         i = try skipUntilOneOf(text, " \n\t/>=", i, FAIL);
         if (attr_name_start == i)
-            return FAIL;
+            return t.err(FAIL);
         const attr_name = text[attr_name_start..i];
 
         // Skip whitespace after attr name.
@@ -453,7 +454,7 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
 
         // Skip '='.
         if (text[i] != '=')
-            return FAIL;
+            return t.err(FAIL);
         i += "=".len;
 
         // Skip whitespace after =.
@@ -495,12 +496,12 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
     if (text[i] == '/') {
         if (i + 1 < text.len and text[i + 1] == '>')
             return i + "/>".len;
-        return FAIL;
+        return t.err(FAIL);
     }
 
     // Skip closing '>'.
     if (text[i] != '>')
-        return FAIL;
+        return t.err(FAIL);
     i += ">".len;
 
     // These tags must be self closed and support "only open" form like `<br>`
@@ -512,9 +513,9 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
 
     // `<nowiki>` and `<math>` do not look for nested wikicode elements.
     if (std.mem.eql(u8, tag_name, "math"))
-        return try parseHtmlTagEscaped(html_tag_node, "</math", text, i, Error.InvalidMathTag);
+        return try parseHtmlTagEscaped(html_tag_node, "</math", text, i, Error.InvalidMathTag, t);
     if (std.mem.eql(u8, tag_name, "nowiki")) {
-        return try parseHtmlTagEscaped(html_tag_node, "</nowiki", text, i, Error.InvalidMathTag);
+        return try parseHtmlTagEscaped(html_tag_node, "</nowiki", text, i, Error.InvalidMathTag, t);
     }
 
     var cur_text_node = text[i..];
@@ -533,19 +534,19 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
 
             // Validate.
             if (!std.mem.eql(u8, close_tag_name, tag_name))
-                return FAIL;
+                return t.err(FAIL);
 
             // Skip whitespace after tag name.
             i = try skipWhileOneOf(text, &.{ ' ', '\t', '\n' }, i, FAIL);
             if (text[i] != '>')
-                return FAIL;
+                return t.err(FAIL);
 
             return i + 1;
         } else if (nextEql(text, "<!--", i)) {
             // HTML comment.
             try createAndAppendTextNodeIfNotEmpty(html_tag_node, cur_text_node);
 
-            i = try skipHtmlComment(text, i);
+            i = try skipHtmlComment(text, i, t);
 
             cur_text_node = text[i..];
             cur_text_node.len = 0;
@@ -553,7 +554,7 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
             // Nested html tag.
             try createAndAppendTextNodeIfNotEmpty(html_tag_node, cur_text_node);
 
-            i = try parseHtmlTag(html_tag_node, text, i);
+            i = try parseHtmlTag(html_tag_node, text, i, t);
 
             cur_text_node = text[i..];
             cur_text_node.len = 0;
@@ -561,7 +562,7 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
             // Template.
             try createAndAppendTextNodeIfNotEmpty(html_tag_node, cur_text_node);
 
-            i = try parseTemplate(html_tag_node, text, i);
+            i = try parseTemplate(html_tag_node, text, i, t);
 
             cur_text_node = text[i..];
             cur_text_node.len = 0;
@@ -572,13 +573,13 @@ fn parseHtmlTag(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
         }
     }
 
-    return FAIL;
+    return t.err(FAIL);
 }
 
 /// Finds `end_tag` without looking for nested wikicode elements
 ///
 /// Tag end should have "</" prepended
-fn parseHtmlTagEscaped(html_tag_node: *MWAstNode, tag_end: []const u8, text: []const u8, pos: usize, E: Error) Error!usize {
+fn parseHtmlTagEscaped(html_tag_node: *MWAstNode, tag_end: []const u8, text: []const u8, pos: usize, E: Error, t: anytype) Error!usize {
     const content_start = pos;
     var i = pos;
     while (i < text.len - tag_end.len) : (i += 1) {
@@ -595,10 +596,10 @@ fn parseHtmlTagEscaped(html_tag_node: *MWAstNode, tag_end: []const u8, text: []c
         }
     }
 
-    return E;
+    return t.err(E);
 }
 
-fn parseWikiLink(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+fn parseWikiLink(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.BadWikiLink;
 
     const wiki_link_node = try parent.createChildNode(.{ .wiki_link = .{ .article = "" } });
@@ -637,21 +638,21 @@ fn parseWikiLink(parent: *MWAstNode, text: []const u8, start: usize) Error!usize
     }
 
     if (text[i] != '|')
-        return FAIL;
+        return t.err(FAIL);
 
     i += "|".len;
 
     while (i < text.len) {
-        i, const last = try parseArgument(wiki_link_node, text, i, Error.BadWikiLinkArg);
+        i, const last = try parseArgument(wiki_link_node, text, i, Error.BadWikiLinkArg, t);
 
         if (last)
             return i;
     }
 
-    return FAIL;
+    return t.err(FAIL);
 }
 
-fn parseTemplate(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+fn parseTemplate(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.BadTemplate;
 
     var i = start + "{{".len;
@@ -672,21 +673,21 @@ fn parseTemplate(parent: *MWAstNode, text: []const u8, start: usize) Error!usize
         return i + "}}".len;
 
     if (text[i] != '|')
-        return FAIL;
+        return t.err(FAIL);
     i += "|".len;
 
     // Parse args.
     while (i < text.len) {
-        i, const last = try parseArgument(template_node, text, i, Error.BadTemplateArg);
+        i, const last = try parseArgument(template_node, text, i, Error.BadTemplateArg, t);
         if (last)
             return i;
     }
 
-    return FAIL;
+    return t.err(FAIL);
 }
 
 /// Parses template / wikilink argument with start pointing to the first character
-fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error) Error!struct { usize, bool } {
+fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error, t: anytype) Error!struct { usize, bool } {
     std.debug.assert(parent.nodeType() == .wiki_link or parent.nodeType() == .template);
 
     var arg_node = try parent.createChildNode(.{ .argument = .{} });
@@ -728,10 +729,10 @@ fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error) E
 
                 if (nextEql(text, "!--", i + 1)) {
                     // Comment.
-                    i = try skipHtmlComment(text, i);
+                    i = try skipHtmlComment(text, i, t);
                 } else {
                     // Html tag.
-                    i = try parseHtmlTag(arg_node, text, i);
+                    i = try parseHtmlTag(arg_node, text, i, t);
                 }
 
                 cur_text_node = text[i..];
@@ -755,7 +756,7 @@ fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error) E
                     // Nested tag.
                     try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
 
-                    i = try parseTemplate(arg_node, text, i);
+                    i = try parseTemplate(arg_node, text, i, t);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -778,7 +779,7 @@ fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error) E
                     // Wikilink.
                     try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
 
-                    i = try parseWikiLink(arg_node, text, i);
+                    i = try parseWikiLink(arg_node, text, i, t);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -786,7 +787,7 @@ fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error) E
                     // External link.
                     try createAndAppendTextNodeIfNotEmpty(arg_node, cur_text_node);
 
-                    i = try parseExternalLink(arg_node, text, i);
+                    i = try parseExternalLink(arg_node, text, i, t);
 
                     cur_text_node = text[i..];
                     cur_text_node.len = 0;
@@ -833,7 +834,7 @@ fn parseArgument(parent: *MWAstNode, text: []const u8, start: usize, E: Error) E
     return E;
 }
 
-fn parseExternalLink(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+fn parseExternalLink(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.BadExternalLink;
 
     // skip opening [
@@ -863,7 +864,7 @@ fn parseExternalLink(parent: *MWAstNode, text: []const u8, start: usize) Error!u
     const name = text[name_start..i];
 
     if (text[i] != ']')
-        return FAIL;
+        return t.err(FAIL);
 
     const external_link_node = try parent.createChildNode(.{
         .external_link = .{ .url = url, .title = name },
@@ -894,13 +895,19 @@ fn parseHtmlEntity(parent: *MWAstNode, text: []const u8, start: usize) Error!str
             // Hex.
             i += "x".len;
         }
+        var n_digits: usize = 0;
         while (i < MAX_ENTITY_LEN) : (i += 1) {
             if (text[i] == ';') {
+                if (n_digits < 2)
+                    return FAIL;
                 const html_entity_node = try parent.createChildNode(.{ .html_entity = text[start .. i + 1] });
                 return .{ i + 1, html_entity_node };
             }
-            if (!std.ascii.isDigit(text[i]))
+            if (std.ascii.isDigit(text[i])) {
+                n_digits += 1;
+            } else {
                 return FAIL;
+            }
         }
     } else {
         // Character.
@@ -915,7 +922,7 @@ fn parseHtmlEntity(parent: *MWAstNode, text: []const u8, start: usize) Error!str
     return FAIL;
 }
 
-fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize) Error!usize {
+fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize, t: anytype) Error!usize {
     const FAIL = Error.IncompleteHeading;
 
     const heading_node = try parent.createChildNode(.{ .heading = .{ .level = 0 } });
@@ -928,7 +935,7 @@ fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
     while (i < text.len) : (i += 1) {
         switch (text[i]) {
             '=' => level += 1,
-            '\n' => return FAIL,
+            '\n' => return t.err(FAIL),
             else => break,
         }
     }
@@ -949,9 +956,9 @@ fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
                 try createAndAppendTextNodeIfNotEmpty(heading_node, cur_text_node);
 
                 if (nextEql(text, "<!--", i)) {
-                    i = try skipHtmlComment(text, i);
+                    i = try skipHtmlComment(text, i, t);
                 } else {
-                    i = try parseHtmlTag(heading_node, text, i);
+                    i = try parseHtmlTag(heading_node, text, i, t);
                 }
 
                 cur_text_node = text[i..];
@@ -960,7 +967,7 @@ fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
             '=' => {
                 // End of heading.
                 if (!nextEqlCount(text, '=', level, i))
-                    return FAIL;
+                    return t.err(FAIL);
 
                 cur_text_node = std.mem.trimRight(u8, cur_text_node, &.{ ' ', '\t' });
 
@@ -978,13 +985,13 @@ fn parseHeading(parent: *MWAstNode, text: []const u8, start: usize) Error!usize 
         }
     }
 
-    return FAIL;
+    return t.err(FAIL);
 }
 
 /// NOTE: This does not add a table node, it just skips after the closing `|}`
 ///
 /// `pos` should point to the opening `{|`
-fn skipTable(text: []const u8, pos: usize) !usize {
+fn skipTable(text: []const u8, pos: usize, t: anytype) !usize {
     var i = pos + "{|".len;
 
     while (i < text.len) {
@@ -994,27 +1001,27 @@ fn skipTable(text: []const u8, pos: usize) !usize {
         i += "|".len;
     }
 
-    return Error.IncompleteTable;
+    return t.err(Error.IncompleteTable);
 }
 
 /// moves to `pos` to after the comment,
 /// or returns `Error.UnclosedHtmlComment` if none is found
 ///
 /// `pos` should point to the first char of `<!--`
-fn skipHtmlComment(text: []const u8, pos: usize) !usize {
+fn skipHtmlComment(text: []const u8, pos: usize, t: anytype) !usize {
     var i = pos + "<!--".len;
     while (i <= text.len - "-->".len) : (i += 1) {
         if (std.mem.eql(u8, text[i .. i + "-->".len], "-->"))
             return i + "-->".len;
     }
-    return Error.UnclosedHtmlComment;
+    return t.err(Error.UnclosedHtmlComment);
 }
 
 ///////////////////////////////////////////////////////////////////////
 // Parser utility functions.
 
 /// allocates and appends text node IF `text.len > 0`
-inline fn createAndAppendTextNodeIfNotEmpty(parent: *MWAstNode, text: []const u8) !void {
+inline fn createAndAppendTextNodeIfNotEmpty(parent: *MWAstNode, text: []const u8) error{OutOfMemory}!void {
     if (text.len == 0)
         return;
     const txt_node = try parent.createChildNode(.{ .text = text });
@@ -1139,7 +1146,7 @@ test "TABLE skips" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 2);
 
@@ -1161,7 +1168,7 @@ test "COMMENT fails on unclosed" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const e = parseDocument(a, wikitext);
+    const e = parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expectError(Error.UnclosedHtmlComment, e);
 }
@@ -1173,7 +1180,7 @@ test "COMMENT correct" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 0);
 }
@@ -1187,26 +1194,26 @@ test "COMMENT skips enclosed '-' and embedded tags" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 0);
 }
 
 test "HTML_ENTITY fails over malformed" {
     const non_numerical_num: []const u8 = "&#hello;";
-    const too_many_digits: []const u8 = "&#12345;";
+    const too_long: []const u8 = "&#12345;";
     const too_few_digits: []const u8 = "&#1;";
     const unclosed: []const u8 = "&hello";
 
-    const cases = [_][]const u8{ non_numerical_num, too_many_digits, too_few_digits, unclosed };
+    const cases = [_][]const u8{ non_numerical_num, too_long, too_few_digits, unclosed };
     for (cases) |case| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
 
-        const doc = try parseDocument(a, case);
+        const doc = try parseDocument(a, case, TestTrace(Error){});
         try std.testing.expect(doc.n_children == 1);
-        //try std.testing.expect(doc.first_child.?.nodeType() == .text);
+        try std.testing.expect(doc.first_child.?.nodeType() == .text);
     }
 }
 
@@ -1223,7 +1230,7 @@ test "HTML_ENTITY correct parse" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, big_num ++ sm_num ++ hex_num ++ s_one ++ s_two);
+    const doc = try parseDocument(a, big_num ++ sm_num ++ hex_num ++ s_one ++ s_two, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == entities.len);
 
@@ -1246,7 +1253,7 @@ test "EXTERNAL_LINK no title" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1264,7 +1271,7 @@ test "EXTERNAL_LINK title" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1281,7 +1288,7 @@ test "TEMPLATE no args" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1297,7 +1304,7 @@ test "TEMPLATE text argument no name" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1319,7 +1326,7 @@ test "TEMPLATE child as arg" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1342,7 +1349,7 @@ test "TEMPLATE parses with KV arg" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1366,7 +1373,7 @@ test "TEMPLATE doi link is escaped from parsing" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     const html_tag_node = doc.firstNode(.html_tag).?;
     try std.testing.expect(html_tag_node.n_children == 1);
@@ -1392,7 +1399,7 @@ test "TEMPLATE html comment ends KV arg" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1418,7 +1425,7 @@ test "TEMPLATE '[' treated as text" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
     try std.testing.expect(doc.n_children == 1);
 
     const tmpl_node = doc.firstNode(.template).?;
@@ -1441,7 +1448,7 @@ test "WIKILINK no title" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
     try std.testing.expect(doc.n_children == 1);
 
     switch (doc.first_child.?.n) {
@@ -1459,7 +1466,7 @@ test "WIKILINK title" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1479,7 +1486,7 @@ test "WIKILINK wikitionary namespace" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
     try std.testing.expect(doc.n_children == 1);
 
     const link_node = doc.firstNode(.wiki_link).?;
@@ -1496,7 +1503,7 @@ test "WIKILINK image multiple args" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1534,7 +1541,7 @@ test "HTML_TAG Trivial Correct" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
     try std.testing.expect(doc.n_children == 1);
 
     const html_tag_node = doc.firstNode(.html_tag).?;
@@ -1572,7 +1579,7 @@ test "HTML_TAG Wierd Spacing" {
         defer arena.deinit();
         const a = arena.allocator();
 
-        const doc = try parseDocument(a, case);
+        const doc = try parseDocument(a, case, TestTrace(Error){});
 
         try std.testing.expect(doc.n_children == 1);
 
@@ -1593,7 +1600,7 @@ test "HTML_TAG decodes attributes correctly" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     const html_tag_node = doc.firstNode(.html_tag).?;
     const html_tag_data = try html_tag_node.asHtmlTag();
@@ -1614,7 +1621,7 @@ test "HTML_TAG decodes attribute without quotes" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     const html_tag_node = doc.firstNode(.html_tag).?;
     const html_tag_data = try html_tag_node.asHtmlTag();
@@ -1634,7 +1641,7 @@ test "HTML_TAG decodes with nested comment" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
     try std.testing.expect(doc.n_children == 1);
 
     const html_tag_node = doc.firstNode(.html_tag).?;
@@ -1661,7 +1668,7 @@ test "HTML_TAG decodes nested tags" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1699,7 +1706,7 @@ test "HTML_TAG decodes wrapped template" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
     try std.testing.expect(doc.n_children == 1);
 }
 
@@ -1713,7 +1720,7 @@ test "HTML_TAG <math> ignores '{' and '}'" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     const html_tag_node = doc.firstNode(.html_tag).?;
     const tag_content = html_tag_node.firstNode(.text).?;
@@ -1731,7 +1738,7 @@ test "HTML_TAG <math> ignores '<'" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     const html_tag_node = doc.firstNode(.html_tag).?;
     const tag_content = html_tag_node.firstNode(.text).?;
@@ -1750,7 +1757,7 @@ test "HTML_TAG nowiki is respected" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     const html_tag_node = doc.firstNode(.html_tag).?;
     const tag_content = html_tag_node.firstNode(.text).?;
@@ -1767,7 +1774,7 @@ test "HTML_TAG br, hr must be self closed" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 4);
 }
@@ -1793,7 +1800,7 @@ test "HEADING rejects malformed headings" {
         defer arena.deinit();
         const a = arena.allocator();
 
-        const e = parseDocument(a, case);
+        const e = parseDocument(a, case, TestTrace(Error){});
         try std.testing.expectError(Error.IncompleteHeading, e);
     }
 }
@@ -1810,7 +1817,7 @@ test "HEADING well formed with some text" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 2);
 
@@ -1832,7 +1839,7 @@ test "HEADING embedded html with attributes" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1850,7 +1857,7 @@ test "HEADING parses correctly with following html comment" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1866,7 +1873,7 @@ test "HEADING parses correctly with inline html comment" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
@@ -1887,7 +1894,7 @@ test "HEADING COMMENT well formed heading with some text and a comment" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 3);
 
@@ -2012,7 +2019,7 @@ test "TEMPLATE large country infobox" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const doc = try parseDocument(a, wikitext);
+    const doc = try parseDocument(a, wikitext, TestTrace(Error){});
 
     try std.testing.expect(doc.n_children == 1);
 
