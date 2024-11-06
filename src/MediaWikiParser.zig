@@ -263,6 +263,27 @@ pub const MWAstNode = struct {
             s.n_children = 1;
         }
     }
+
+    pub fn removeChild(s: *Self, node: *MWAstNode) void {
+        if (node.prev) |prev_node| {
+            // Intermediate node.
+            prev_node.next = node.next;
+        } else {
+            // First element of the list.
+            s.first = node.next;
+        }
+
+        if (node.next) |next_node| {
+            // Intermediate node.
+            next_node.prev = node.prev;
+        } else {
+            // Last element of the list.
+            s.last = node.prev;
+        }
+
+        s.n_children -= 1;
+        std.debug.assert(s.len == 0 or (s.first != null and s.last != null));
+    }
 };
 
 pub const Error = error{
@@ -285,6 +306,7 @@ pub const Error = error{
     InvalidDataCast,
 
     OutOfMemory,
+    NoSpaceLeft,
 };
 
 pub fn parseDocument(a: std.mem.Allocator, text: []const u8, t: anytype) !MWAstNode {
@@ -1027,6 +1049,37 @@ fn skipHtmlComment(text: []const u8, pos: usize, t: anytype) !usize {
             return i + "-->".len;
     }
     return t.err(Error.UnclosedHtmlComment);
+}
+
+///////////////////////////////////////////////////////////////////////
+// AstMatching Functions.
+
+/// Runs `callback` on all nodes of type `target`
+pub fn traverse(doc: *MWAstNode, target: MWAstNode.NodeType, T: type, callback: fn (n: *MWAstNode, state: T) Error!void, state: T) Error!void {
+    std.debug.assert(doc.nodeType() == .document);
+
+    if (doc.n_children == 0)
+        return;
+
+    std.debug.assert(doc.first_child != null and doc.last_child != null);
+
+    try _traverse(doc, target, T, callback, state);
+}
+
+/// if `n` is of type `target`, calls `callback`
+///
+/// Vists children recursively
+fn _traverse(n: *MWAstNode, target: MWAstNode.NodeType, T: type, callback: fn (n: *MWAstNode, state: T) Error!void, state: T) !void {
+    if (n.nodeType() == target)
+        try callback(n, state);
+
+    if (n.n_children == 0)
+        return;
+
+    var it = n.first_child;
+    while (it) |child| : (it = child.next) {
+        try _traverse(child, target, T, callback, state);
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////

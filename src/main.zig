@@ -3,6 +3,7 @@ const wxmlp = @import("wikixmlparser.zig");
 const SliceArray = @import("slice_array.zig").SliceArray;
 const lzma = @import("lzma.zig");
 const mwp = @import("MediaWikiParser.zig");
+const passes = @import("passes.zig");
 const DuckTrace = @import("tracing.zig").DuckTrace;
 
 pub fn main() !void {
@@ -198,10 +199,20 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
 
 /// Uses `mwp.parseDocument` to convert Wikicode AST to more concise and clean text
 fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8, t: anytype) ![]const u8 {
-    const doc = try mwp.parseDocument(a, raw_wikitext, t);
+    var doc = try mwp.parseDocument(a, raw_wikitext, t);
+
+    try passes.removeReferences(&doc);
+
+    try passes.toText(a, &doc);
+
+    const out = try a.alloc(u8, try passes.textSize(&doc));
+    var out_strm = std.io.fixedBufferStream(out);
+    const out_wtr = out_strm.writer();
+
+    try passes.writeText(&doc, out_wtr);
+
     try t.success();
-    std.debug.assert(doc.n_children > 0);
-    return raw_wikitext;
+    return out;
 }
 
 pub const Stats = struct {
