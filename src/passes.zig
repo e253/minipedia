@@ -11,7 +11,7 @@ pub const Error = error{
 
     OutOfMemory,
     NoSpaceLeft,
-} || wmp.Error;
+} || error{InvalidDataCast};
 
 pub fn removeReferences(n: *MWAstNode) !void {
     std.debug.assert(n.nodeType() == .document);
@@ -25,16 +25,47 @@ pub fn removeReferences(n: *MWAstNode) !void {
             if (child.first_child) |fc| {
                 if (fc.nodeType() == .text) {
                     if (std.mem.eql(u8, (try fc.asText()), "References")) {
-                        // TODO: safety check
-                        const prev = child.prev.?;
-                        // TODO: accurately update n_children
-                        n.last_child = prev;
-                        prev.next = null;
+                        n.removeChildAndEndList(child);
+                        return;
                     }
                 }
             }
         }
     }
+}
+
+/// Actions that make the AST possible to work with, no logic
+///
+/// 1. All html tag names and attribute names are lowercased.
+///
+/// 2. Template names and argument names are lowered.
+pub fn cleanAST(n: *MWAstNode) !void {
+    std.debug.assert(n.nodeType() == .document);
+
+    try wmp.traverse(n, .html_tag, ?usize, Error, lowerHtmlTagNameAndAttributes, null);
+    try wmp.traverse(n, .template, ?usize, Error, lowerTemplateNamesAndArgNames, null);
+}
+
+fn lowerHtmlTagNameAndAttributes(n: *MWAstNode, _: ?usize) Error!void {
+    const htag = try n.asHtmlTag();
+
+    const nc_tag_name: []u8 = @constCast(htag.tag_name);
+
+    for (nc_tag_name, 0..) |c, i| nc_tag_name[i] = std.ascii.toLower(c);
+
+    var it = htag.attrs.first;
+    while (it) |attr| : (it = attr.next) {
+        const nc_attr_name: []u8 = @constCast(attr.data.name);
+
+        for (nc_attr_name, 0..) |c, i| nc_attr_name[i] = std.ascii.toLower(c);
+    }
+}
+
+fn lowerTemplateNamesAndArgNames(n: *MWAstNode, _: ?usize) Error!void {
+    const templ = try n.asTemplate();
+
+    const nc_name: []u8 = @constCast(templ.name);
+    for (nc_name, 0..) |c, i| nc_name[i] = std.ascii.toLower(c);
 }
 
 pub fn textSize(n: *MWAstNode) !usize {
@@ -60,6 +91,8 @@ pub fn writeText(n: *MWAstNode, writer: anytype) !void {
 }
 
 /// Traverses AST and replaces node with markdown text
+///
+/// If invoked on a non `.document` node it changes that node to text or removes it
 pub fn toText(a: std.mem.Allocator, n: *MWAstNode) Error!void {
     switch (n.n) {
         .template => try renderTemplateToMarkdown(n, a),
@@ -70,7 +103,7 @@ pub fn toText(a: std.mem.Allocator, n: *MWAstNode) Error!void {
         .html_entity => try renderHtmlEntity(n, a),
         .argument => return Error.SpuriousArgumentNode,
         .text => return,
-        .table => return,
+        .table => unreachable,
         .document => {
             var it = n.first_child;
             while (it) |child| : (it = child.next) {
@@ -81,28 +114,67 @@ pub fn toText(a: std.mem.Allocator, n: *MWAstNode) Error!void {
 }
 
 pub fn renderHtmlTagToMarkdown(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!void {
+    if (n.n_children == 0) {
+        n.*.n = .{ .text = "" };
+        return;
+    }
+
+    const eq = std.mem.eql;
+
     const htag = try n.asHtmlTag();
-    if (std.mem.eql(u8, "math", htag.tag_name)) {
+    const tag_name = htag.tag_name;
+    if (eq(u8, "math", tag_name)) {
         // TODO: throw error
         const latex_src = try n.first_child.?.asText();
-        const text_size = latex_src.len + "$$".len * 2;
+        const buf_size = latex_src.len + "$$".len;
 
-        const text = try a.alloc(u8, text_size);
-        var text_strm = std.io.fixedBufferStream(text);
-        const text_wr = text_strm.writer();
+        const buf = try a.alloc(u8, buf_size);
+        var buf_strm = std.io.fixedBufferStream(buf);
+        const buf_wr = buf_strm.writer();
 
-        try text_wr.writeAll("$$");
-        try text_wr.writeAll(latex_src);
-        try text_wr.writeAll("$$");
+        try buf_wr.writeAll("$");
+        try buf_wr.writeAll(latex_src);
+        try buf_wr.writeAll("$");
 
-        n.*.n = .{ .text = text };
-    } else if (std.mem.eql(u8, "nowiki", htag.tag_name)) {
+        n.*.n = .{ .text = buf };
+    } else if (eq(u8, "nowiki", tag_name)) {
         if (n.first_child) |fc| {
             n.*.n = .{ .text = try fc.asText() };
         } else {
-            // TODO log this
             n.*.n = .{ .text = "" };
         }
+    } else if (eq(u8, "sup", tag_name) or eq(u8, "sub", tag_name)) {
+        var buf_size = "<></>".len + tag_name.len * 2;
+        var it = n.first_child;
+
+        while (it) |child| : (it = child.next) {
+            try toText(a, child);
+            switch (child.n) {
+                .text => |txt| buf_size += txt.len,
+                else => continue,
+            }
+        }
+
+        const buf = try a.alloc(u8, buf_size);
+        var buf_strm = std.io.fixedBufferStream(buf);
+        const buf_wtr = buf_strm.writer();
+
+        try buf_wtr.writeByte('<');
+        try buf_wtr.writeAll(tag_name);
+        try buf_wtr.writeByte('>');
+
+        while (it) |child| : (it = child.next) {
+            switch (child.n) {
+                .text => |txt| try buf_wtr.writeAll(txt),
+                else => continue,
+            }
+        }
+
+        try buf_wtr.writeAll("</");
+        try buf_wtr.writeAll(tag_name);
+        try buf_wtr.writeByte('>');
+
+        n.*.n = .{ .text = buf };
     } else {
         n.*.n = .{ .text = "" };
     }
@@ -146,72 +218,57 @@ pub fn renderWikiLinkToMarkdown(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!v
     const wl = try n.asWikiLink();
 
     switch (wl.namespace) {
-        .Main => {
-            var link_name_size: usize = 0;
+        .Main, .Wikitionary => {
+            // TODO: log this more efficiently
+            //if (n.n_children > 1) {
+            //    std.debug.print("Link with {} children\n", .{n.n_children});
+            //}
 
-            if (n.n_children > 1) {
-                std.debug.print("Link with {} children\n", .{n.n_children});
-            }
+            var buf_size: usize = "[[]]".len + wl.article.len;
+            if (wl.namespace == .Wikitionary)
+                buf_size += "wikt:".len;
 
             const caption_arg_node_opt = n.last_child;
             if (caption_arg_node_opt) |caption_arg_node| {
+                std.debug.assert(caption_arg_node.n_children > 0);
+
+                buf_size += "|".len;
+
                 var it = caption_arg_node.first_child;
                 while (it) |child| : (it = child.next) {
-                    if (child.nodeType() == .text) {
-                        link_name_size += (try child.asText()).len;
-                    } else {
-                        if (child.nodeType() == .html_tag) {
-                            std.debug.print("<{s}>\n", .{(try child.asHtmlTag()).tag_name});
-                        } else {
-                            std.debug.print("Child of type {s} under caption arg\n", .{child.nodeTypeStr()});
-                        }
+                    try toText(a, child);
+                    switch (child.n) {
+                        .text => |txt| buf_size += txt.len,
+                        else => continue,
                     }
                 }
             }
 
-            const link_buf = try a.alloc(u8, wl.article.len + link_name_size + "[](/)".len);
-            var link_buf_stream = std.io.fixedBufferStream(link_buf);
-            const link_buf_writer = link_buf_stream.writer();
+            const buf = try a.alloc(u8, buf_size);
+            var buf_strm = std.io.fixedBufferStream(buf);
+            const buf_wrtr = buf_strm.writer();
 
-            try link_buf_writer.writeByte('[');
-            if (link_name_size != 0) {
-                var it = n.last_child.?.first_child;
+            try buf_wrtr.writeAll("[[");
+            if (wl.namespace == .Wikitionary)
+                try buf_wrtr.writeAll("wikt:");
+            try buf_wrtr.writeAll(wl.article);
+
+            const caption_arg_node_opt2 = n.last_child;
+            if (caption_arg_node_opt2) |caption_arg_node| {
+                try buf_wrtr.writeByte('|');
+
+                var it = caption_arg_node.first_child;
                 while (it) |child| : (it = child.next) {
-                    if (child.nodeType() == .text)
-                        try link_buf_writer.writeAll(try child.asText());
+                    switch (child.n) {
+                        .text => |txt| try buf_wrtr.writeAll(txt),
+                        else => continue,
+                    }
                 }
             }
-            try link_buf_writer.writeAll("](");
-            try link_buf_writer.writeByte('/');
-            try link_buf_writer.writeAll(wl.article);
-            try link_buf_writer.writeByte(')');
 
-            std.mem.replaceScalar(u8, link_buf["[](/".len + link_name_size ..], ' ', '_');
+            try buf_wrtr.writeAll("]]");
 
-            n.*.n = .{ .text = link_buf };
-        },
-        .Image, .File => {
-            // TODO: render dummy image with caption.
-            n.*.n = .{ .text = "" };
-        },
-        .Wikitionary => {
-            const wikitionary_base: []const u8 = "https://en.wikitionary.org/wiki/";
-            const link_buf_size = "[".len + wl.article.len + "]".len + "(".len + wikitionary_base.len + wl.article.len + ")".len;
-
-            const link_buf = try a.alloc(u8, link_buf_size);
-            var link_buf_stream = std.io.fixedBufferStream(link_buf);
-            const link_buf_writer = link_buf_stream.writer();
-
-            try link_buf_writer.writeByte('[');
-            try link_buf_writer.writeAll(wl.article);
-            try link_buf_writer.writeByte(']');
-
-            try link_buf_writer.writeByte('(');
-            try link_buf_writer.writeAll(wikitionary_base);
-            try link_buf_writer.writeAll(wl.article);
-            try link_buf_writer.writeByte(')');
-
-            n.*.n = .{ .text = link_buf };
+            n.*.n = .{ .text = buf };
         },
         .Unknown => {
             const link_buf_size = wl.article.len + "[](/bad)".len;
@@ -226,6 +283,10 @@ pub fn renderWikiLinkToMarkdown(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!v
             try link_buf_writer.writeAll("(/bad)");
 
             n.*.n = .{ .text = link_buf };
+        },
+        .Image, .File => {
+            // TODO: render dummy image with caption.
+            n.*.n = .{ .text = "" };
         },
     }
 }

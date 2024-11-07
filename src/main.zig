@@ -20,7 +20,7 @@ pub fn main() !void {
     const out = out_file.writer();
     defer out_file.close();
 
-    const fbaBuffer = try std.heap.c_allocator.alloc(u8, 1_609_780_728);
+    const fbaBuffer = try std.heap.c_allocator.alloc(u8, 4_194_304);
     defer std.heap.c_allocator.free(fbaBuffer);
     var fba = std.heap.FixedBufferAllocator.init(fbaBuffer);
     const fbaAlloc = fba.allocator();
@@ -85,7 +85,7 @@ pub fn main() !void {
         // block is full! compress contents and flush them out
         // add a block_offset to the array
         if (lzma_block_size + size_to_write >= lzma_block_size_limit) {
-            const compressed_output = try lzma.compress(&alloc, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
+            const compressed_output = try lzma.compress(null, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
             try out.writeAll(compressed_output);
 
             if (block_offsets.items.len == 0) {
@@ -200,6 +200,8 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
 /// Uses `mwp.parseDocument` to convert Wikicode AST to more concise and clean text
 fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8, t: anytype) ![]const u8 {
     var doc = try mwp.parseDocument(a, raw_wikitext, t);
+
+    try passes.cleanAST(&doc);
 
     try passes.removeReferences(&doc);
 

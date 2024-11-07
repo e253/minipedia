@@ -145,59 +145,59 @@ pub const MWAstNode = struct {
         return null;
     }
 
-    pub fn asText(s: *Self) ![]const u8 {
+    pub fn asText(s: *Self) error{InvalidDataCast}![]const u8 {
         switch (s.n) {
             .text => |d| return d,
-            else => return Error.InvalidDataCast,
+            else => return error.InvalidDataCast,
         }
     }
 
-    pub fn asTemplate(s: *Self) !Template {
+    pub fn asTemplate(s: *Self) error{InvalidDataCast}!Template {
         switch (s.n) {
             .template => |t| return t,
-            else => return Error.InvalidDataCast,
+            else => return error.InvalidDataCast,
         }
     }
 
-    pub fn asArg(s: *Self) !Argument {
+    pub fn asArg(s: *Self) error{InvalidDataCast}!Argument {
         switch (s.n) {
             .argument => |a| return a,
-            else => return Error.InvalidDataCast,
+            else => return error.InvalidDataCast,
         }
     }
 
-    pub fn asExternalLink(s: *Self) !ExternalLink {
+    pub fn asExternalLink(s: *Self) error{InvalidDataCast}!ExternalLink {
         switch (s.n) {
             .external_link => |el| return el,
-            else => return Error.InvalidDataCast,
+            else => return error.InvalidDataCast,
         }
     }
 
-    pub fn asWikiLink(s: *Self) !WikiLink {
+    pub fn asWikiLink(s: *Self) error{InvalidDataCast}!WikiLink {
         switch (s.n) {
             .wiki_link => |wl| return wl,
-            else => return Error.InvalidDataCast,
+            else => return error.InvalidDataCast,
         }
     }
 
-    pub fn asHtmlTag(s: *Self) !HtmlTag {
+    pub fn asHtmlTag(s: *Self) error{InvalidDataCast}!HtmlTag {
         switch (s.n) {
             .html_tag => |ht| return ht,
-            else => return Error.InvalidDataCast,
+            else => return error.InvalidDataCast,
         }
     }
 
-    pub fn asHtmlEntity(s: *Self) ![]const u8 {
+    pub fn asHtmlEntity(s: *Self) error{InvalidDataCast}![]const u8 {
         switch (s.n) {
             .html_entity => |he| return he,
-            else => return Error.InvalidDataCast,
+            else => return error.InvalidDataCast,
         }
     }
 
-    pub fn asHeading(s: *Self) !Heading {
+    pub fn asHeading(s: *Self) error{InvalidDataCast}!Heading {
         switch (s.n) {
             .heading => |heading| return heading,
-            else => return Error.InvalidDataCast,
+            else => return error.InvalidDataCast,
         }
     }
 
@@ -270,7 +270,7 @@ pub const MWAstNode = struct {
             prev_node.next = node.next;
         } else {
             // First element of the list.
-            s.first = node.next;
+            s.first_child = node.next;
         }
 
         if (node.next) |next_node| {
@@ -278,11 +278,34 @@ pub const MWAstNode = struct {
             next_node.prev = node.prev;
         } else {
             // Last element of the list.
-            s.last = node.prev;
+            s.last_child = node.prev;
         }
 
         s.n_children -= 1;
-        std.debug.assert(s.len == 0 or (s.first != null and s.last != null));
+        std.debug.assert(s.n_children == 0 or (s.first_child != null and s.last_child != null));
+    }
+
+    /// Removes `node` and all elements afterward
+    pub fn removeChildAndEndList(s: *Self, node: *MWAstNode) void {
+        if (node.prev) |prev_node| {
+            // Not element of list.
+            s.last_child = prev_node;
+            prev_node.next = null;
+
+            var n_nodes_removed: usize = 1;
+            var it = node.next;
+            while (it) |_node| : (it = _node.next) {
+                n_nodes_removed += 1;
+            }
+
+            std.debug.assert(s.n_children - n_nodes_removed >= 0);
+            s.n_children -= n_nodes_removed;
+        } else {
+            // First element of the list.
+            s.first_child = null;
+            s.last_child = null;
+            s.n_children = 0;
+        }
     }
 };
 
@@ -1055,7 +1078,7 @@ fn skipHtmlComment(text: []const u8, pos: usize, t: anytype) !usize {
 // AstMatching Functions.
 
 /// Runs `callback` on all nodes of type `target`
-pub fn traverse(doc: *MWAstNode, target: MWAstNode.NodeType, T: type, callback: fn (n: *MWAstNode, state: T) Error!void, state: T) Error!void {
+pub fn traverse(doc: *MWAstNode, target: MWAstNode.NodeType, T: type, ErrorSet: type, callback: fn (n: *MWAstNode, state: T) ErrorSet!void, state: T) ErrorSet!void {
     std.debug.assert(doc.nodeType() == .document);
 
     if (doc.n_children == 0)
@@ -1063,13 +1086,13 @@ pub fn traverse(doc: *MWAstNode, target: MWAstNode.NodeType, T: type, callback: 
 
     std.debug.assert(doc.first_child != null and doc.last_child != null);
 
-    try _traverse(doc, target, T, callback, state);
+    try _traverse(doc, target, T, ErrorSet, callback, state);
 }
 
 /// if `n` is of type `target`, calls `callback`
 ///
 /// Vists children recursively
-fn _traverse(n: *MWAstNode, target: MWAstNode.NodeType, T: type, callback: fn (n: *MWAstNode, state: T) Error!void, state: T) !void {
+fn _traverse(n: *MWAstNode, target: MWAstNode.NodeType, T: type, ErrorSet: type, callback: fn (n: *MWAstNode, state: T) ErrorSet!void, state: T) ErrorSet!void {
     if (n.nodeType() == target)
         try callback(n, state);
 
@@ -1078,7 +1101,7 @@ fn _traverse(n: *MWAstNode, target: MWAstNode.NodeType, T: type, callback: fn (n
 
     var it = n.first_child;
     while (it) |child| : (it = child.next) {
-        try _traverse(child, target, T, callback, state);
+        try _traverse(child, target, T, ErrorSet, callback, state);
     }
 }
 
