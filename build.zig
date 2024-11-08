@@ -90,6 +90,20 @@ pub fn build(b: *std.Build) void {
     lzma.installHeadersDirectory(xz_tools.path("src/liblzma/api"), "", .{});
     b.installArtifact(lzma);
 
+    const md4c_upstream = b.dependency("md4c", .{});
+    const md4c = b.addStaticLibrary(.{
+        .name = "md4c",
+        .target = target,
+        .optimize = optimize,
+    });
+    md4c.addCSourceFiles(.{
+        .root = md4c_upstream.path("src"),
+        .files = &.{ "entity.c", "md4c.c", "md4c-html.c" },
+    });
+    md4c.installHeadersDirectory(md4c_upstream.path("src"), "", .{});
+    md4c.linkLibC();
+    b.installArtifact(md4c);
+
     const exe = b.addExecutable(.{
         .name = "main",
         .root_source_file = b.path("src/main.zig"),
@@ -115,10 +129,14 @@ pub fn build(b: *std.Build) void {
     get_article.linkLibrary(lzma);
     b.installArtifact(get_article);
 
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
+    const server = b.addExecutable(.{
+        .name = "server",
+        .root_source_file = b.path("src/browser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server.linkLibC();
+    b.installArtifact(server);
 
     const wikiparserxml_tests = b.addTest(.{
         .root_source_file = b.path("src/wikixmlparser.zig"),
