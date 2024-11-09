@@ -1,56 +1,66 @@
 const std = @import("std");
-const std_options = .{ .log_level = .debug };
+const httpz = @import("httpz");
+const stdout = std.io.getStdOut();
+const MinidumpReader = @import("minidump_reader.zig");
 
-const alloc = std.heap.c_allocator;
+const c_allocator = std.heap.c_allocator;
 
-pub fn main() !void {
-    const address = std.net.Address.parseIp("127.0.0.1", 3000) catch unreachable;
-    try std.io.getStdOut().writeAll("listening http://127.0.0.1:3000\n");
-    var http_server = try address.listen(.{});
+const ADDRESS = "127.0.0.1";
+const PORT: u16 = 3000;
 
-    while (true) {
-        const connection = try http_server.accept();
-        _ = std.Thread.spawn(.{}, handleConnection, .{connection}) catch |err| {
-            std.log.err("unable to accept connection: {s}", .{@errorName(err)});
-        };
-    }
-}
-
-const Context = struct {
-    a: std.mem.Allocator,
+pub const State = struct {
+    mdr: MinidumpReader,
 };
 
-fn handleConnection(connection: std.net.Server.Connection) void {
-    defer connection.stream.close();
+pub fn main() !void {
+    const mdr = try MinidumpReader.init(c_allocator, "./out.minidump");
+    const state = State{ .mdr = mdr };
 
-    var read_buffer: [8000]u8 = undefined;
-    var server = std.http.Server.init(connection, &read_buffer);
-    while (server.state == .ready) {
-        // grab request
-        var request = server.receiveHead() catch |err| switch (err) {
-            error.HttpConnectionClosing => return,
-            else => {
-                std.log.err("closing http connection: {s}", .{@errorName(err)});
-                return;
-            },
-        };
-        handleRequest(&request) catch |err| {
-            std.log.err("unabled to handle request {s}: {s}", .{ request.head.target, @errorName(err) });
-            return;
-        };
-    }
+    var server = try httpz.ServerApp(State).init(c_allocator, .{ .address = ADDRESS, .port = PORT }, state);
+    defer server.deinit();
+
+    try std.fmt.format(stdout.writer(), "http://{s}:{}/\n\n", .{ ADDRESS, PORT });
+
+    var router = server.router();
+
+    router.get("/", home);
+    router.get("/wiki/id/:id", serveArticle);
+
+    try server.listen();
 }
 
-fn handleRequest(req: *std.http.Server.Request) !void {
-    const route = req.head.target;
+fn home(s: State, _: *httpz.Request, res: *httpz.Response) !void {
+    const page_fmt =
+        \\<h1> Minipedia </h1>
+        \\<h4>Search from <em>{}</em> articles</h4>
+        \\<hr>
+        \\
+        \\<p> Navigate to '/wiki/id/&lt;id&gt;' </p>
+    ;
+    res.status = 200;
+    try std.fmt.format(res.writer(), page_fmt, .{s.mdr.articleCount()});
+}
 
-    if (std.mem.startsWith(u8, route, "/wiki/") and route.len > "/wiki/".len) {
-        const article = route["/wiki/".len..];
+fn serveArticle(s: State, req: *httpz.Request, res: *httpz.Response) !void {
+    const id_str_opt = req.param("id");
+    if (id_str_opt == null) {
+        res.status = 400;
+        res.body =
+            \\<h1> No article id found </h1>
+        ;
+        return;
+    }
+    const id = std.fmt.parseInt(u64, id_str_opt.?, 10) catch |err| {
+        res.status = 400;
+        try std.fmt.format(res.writer(), "<h1>Could not parse '{s}' to u64. error.{s}</h1>", .{ id_str_opt.?, @errorName(err) });
+        return;
+    };
 
-        var out_buf: [200]u8 = undefined;
-        const out = try std.fmt.bufPrint(&out_buf, "<h1>{s}<h1>", .{article});
-        try req.respond(out, .{});
+    if (try s.mdr.markdown(id)) |markdown| {
+        res.status = 200;
+        res.body = markdown;
     } else {
-        try req.respond("<h1> No Match </h1>", .{});
+        res.status = 404;
+        try std.fmt.format(res.writer(), "<h1> No article for id {} </h1>", .{id});
     }
 }
