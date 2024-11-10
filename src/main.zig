@@ -6,24 +6,32 @@ const mwp = @import("MediaWikiParser.zig");
 const passes = @import("passes.zig");
 const DuckTrace = @import("tracing.zig").DuckTrace;
 
+const c_allocator = std.heap.c_allocator;
+
 pub fn main() !void {
     const args = try Args.parse();
 
-    var stats: Stats = .{
-        .start_time_ms = std.time.milliTimestamp(),
-    };
+    var stats: Stats = .{ .start_time_ms = std.time.milliTimestamp() };
 
-    var stdinBW = std.io.bufferedReader(std.io.getStdIn().reader());
-    const stdin = stdinBW.reader();
+    var stdinBR = std.io.bufferedReader(std.io.getStdIn().reader());
+    const stdin = stdinBR.reader();
 
     var out_file = try std.fs.cwd().createFile(args.out_file_name, .{});
-    const out = out_file.writer();
     defer out_file.close();
+    const out = out_file.writer();
 
-    const fbaBuffer = try std.heap.c_allocator.alloc(u8, 4_194_304);
-    defer std.heap.c_allocator.free(fbaBuffer);
+    var titles_file = try std.fs.cwd().createFile("titles.txt", .{});
+    defer titles_file.close();
+    var titlesBW = std.io.bufferedWriter(titles_file.writer());
+    const titles = titlesBW.writer();
+
+    const fbaBuffer = try c_allocator.alloc(u8, 4096 * 256);
+    defer c_allocator.free(fbaBuffer);
     var fba = std.heap.FixedBufferAllocator.init(fbaBuffer);
     const fbaAlloc = fba.allocator();
+
+    const page_buffer = try c_allocator.alloc(u8, 4096 * 256);
+    defer c_allocator.free(page_buffer);
 
     // Initialize DuckDB tracing.
     var duckTrace = try DuckTrace(mwp.Error).init("logs.db");
@@ -58,7 +66,7 @@ pub fn main() !void {
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        const xmlPage = wxmlp.nextPageAlloc(alloc, stdin) catch |err| switch (err) {
+        const xmlPage = wxmlp.readPage(stdin, page_buffer) catch |err| switch (err) {
             error.EndOfStream => break,
             else => |e| return e,
         };
@@ -69,6 +77,9 @@ pub fn main() !void {
             stats.n_redirects_skipped += 1;
             continue;
         };
+
+        try titles.writeAll(wikiArticle.title);
+        try titles.writeByte('\n');
 
         stats.total_article_bytes_read += wikiArticle.article.len;
 
@@ -162,7 +173,7 @@ pub fn main() !void {
 ///
 /// Uses `SliceArray` for performance
 ///
-/// `''''` to `***`
+/// `'''''` to `***`
 ///
 /// `'''` to `**`
 ///
@@ -184,7 +195,7 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
     defer sa.deinit();
     try sa.append(article);
 
-    try sa.findAndReplace("''''", "***");
+    try sa.findAndReplace("'''''", "***");
     try sa.findAndReplace("'''", "**");
     try sa.findAndReplace("''", "*");
     try sa.findAndReplace("&quot;", "\"");

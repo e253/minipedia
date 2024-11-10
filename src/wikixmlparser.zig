@@ -2,44 +2,42 @@ const std = @import("std");
 
 /// Gets <page>[content]</page> from wikidump stream.
 /// Returns `error.EndOfStream` for EOF.
-pub fn nextPageAlloc(a: std.mem.Allocator, reader: anytype) ![]const u8 {
-    var al = std.ArrayList(u8).init(a);
+pub fn readPage(reader: anytype, buf: []u8) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
 
-    // Find opening Tag
     while (true) {
         const b: u8 = try reader.readByte();
         if (b == '<') {
             var nextBytes: ["page>".len]u8 = undefined;
             _ = try reader.read(&nextBytes);
             if (std.mem.eql(u8, &nextBytes, "page>")) {
-                try al.appendSlice("<page>");
+                try writer.writeAll("<page>");
                 break;
             }
         }
     }
 
-    // Find closing tag, while reading data in the middle
-    // TODO: transfer page content in one call
     while (true) {
         const b: u8 = try reader.readByte();
         if (b == '<') {
             var nextBytes: ["/page>".len]u8 = undefined;
             _ = try reader.read(&nextBytes);
             if (std.mem.eql(u8, &nextBytes, "/page>")) {
-                break;
+                // Found closing tag.
+                try writer.writeAll("</page>");
+                try writer.writeByte(0);
+                return fbs.getWritten();
             } else {
-                try al.append('<');
-                try al.appendSlice(&nextBytes);
+                // Tag found, but not </page>.
+                try writer.writeByte('<');
+                try writer.writeAll(&nextBytes);
             }
         } else {
-            try al.append(b);
+            // Not '<'.
+            try writer.writeByte(b);
         }
     }
-
-    try al.appendSlice("</page>");
-    try al.append(0);
-
-    return al.items;
 }
 
 const c = @cImport(@cInclude("wikixmlparser.h"));
@@ -103,7 +101,7 @@ test "Invalid XML" {
     try std.testing.expect(parsePage(invalidXML) == null);
 }
 
-test "Page Streaming" {
+test "Page Reading" {
     const onePage: []const u8 =
         \\<page>
         \\<title>Correct</title>
@@ -117,23 +115,21 @@ test "Page Streaming" {
     var fbs = std.io.fixedBufferStream(threePages);
     const r = fbs.reader();
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    var page_buf: [8000]u8 = undefined;
 
-    const first = try nextPageAlloc(alloc, r);
-    try std.testing.expectEqualStrings(onePage, first[0 .. first.len - 1]);
+    const first = try readPage(r, &page_buf);
+    try std.testing.expectEqualStrings(onePage, first[0 .. first.len - 1]); // drop null byte
     try std.testing.expect(first[first.len - 1] == 0);
 
-    const second = try nextPageAlloc(alloc, r);
+    const second = try readPage(r, &page_buf);
     try std.testing.expectEqualStrings(onePage, second[0 .. second.len - 1]);
     try std.testing.expect(second[second.len - 1] == 0);
 
-    const third = try nextPageAlloc(alloc, r);
+    const third = try readPage(r, &page_buf);
     try std.testing.expectEqualStrings(onePage, third[0 .. third.len - 1]);
     try std.testing.expect(third[third.len - 1] == 0);
 
     // eof
-    const hello = nextPageAlloc(alloc, r);
+    const hello = readPage(r, &page_buf);
     try std.testing.expectError(error.EndOfStream, hello);
 }

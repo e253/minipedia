@@ -1,49 +1,5 @@
 const std = @import("std");
 
-pub const SliceArrayIterator = struct {
-    sa: SliceArray,
-    /// index of this slice within `sa`
-    n_slice: usize = 0,
-    /// index within `cur_slice`
-    slice_pos: usize = 0,
-    /// global index across all array elements
-    global_pos: usize = 0,
-    cur_slice: []const u8,
-
-    const Self = @This();
-
-    /// TODO: maybe inline?
-    pub fn next(self: *Self) ?u8 {
-        if (self.slice_pos < self.cur_slice.len) {
-            defer self.slice_pos += 1;
-            return self.cur_slice[self.slice_pos];
-        } else {
-            // no more slices
-            if (self.n_slice + 1 == self.sa.slices.items.len) {
-                return null;
-            }
-            self.n_slice += 1;
-            self.cur_slice = self.sa.slices[self.n_slice];
-            self.slice_pos = 0;
-            return self.cur_slice[self.slice_pos];
-        }
-    }
-
-    // pub fn rewind(self: *Self, n: usize) void {
-    //     std.debug.assert(n < self.sa.len);
-
-    //     if (self.slice_pos - n >= 0) {
-    //         self.slice_pos -= n;
-    //         return;
-    //     }
-    //     while (true) {
-    //         n -= self.cur_slice.len; // will be at least 1
-    //         self.n_slice
-    //         self.cur_slice = self.sa.slices[]
-    //     }
-    // }
-};
-
 pub const SliceArray = struct {
     slices: std.ArrayList([]const u8),
     len: usize,

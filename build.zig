@@ -5,14 +5,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const rxml = b.dependency("rapidxml", .{});
-
     const xz_tools = b.dependency("xz_tools", .{});
 
     const lzma = b.addStaticLibrary(.{
         .name = "lzma",
         .link_libc = true,
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     });
     lzma.addCSourceFiles(.{
         .root = xz_tools.path(""),
@@ -134,10 +133,18 @@ pub fn build(b: *std.Build) void {
     browser.linkLibrary(lzma);
     b.installArtifact(browser);
 
+    const title_search = b.addExecutable(.{
+        .name = "title_search",
+        .root_source_file = b.path("src/title_search.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(title_search);
+
     const wikiparserxml_tests = b.addTest(.{
         .root_source_file = b.path("src/wikixmlparser.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
     });
     wikiparserxml_tests.addCSourceFile(.{ .file = b.path("src/wikixmlparser.cpp") });
     wikiparserxml_tests.addIncludePath(rxml.path(""));
@@ -149,14 +156,14 @@ pub fn build(b: *std.Build) void {
     const slice_array_tests = b.addTest(.{
         .root_source_file = b.path("src/slice_array.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
     });
     const run_slice_array_tests = b.addRunArtifact(slice_array_tests);
 
     const lzma_binding_tests = b.addTest(.{
         .root_source_file = b.path("src/lzma.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
     });
     lzma_binding_tests.linkLibC();
     lzma_binding_tests.linkLibrary(lzma);
@@ -165,7 +172,7 @@ pub fn build(b: *std.Build) void {
     const mwp_tests = b.addTest(.{
         .root_source_file = b.path("src/MediaWikiParser.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .Debug,
     });
     const run_mwp_tests = b.addRunArtifact(mwp_tests);
 
