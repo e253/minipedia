@@ -5,97 +5,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const rxml = b.dependency("rapidxml", .{});
-    const xz_tools = b.dependency("xz_tools", .{});
-
-    const lzma = b.addStaticLibrary(.{
-        .name = "lzma",
-        .link_libc = true,
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    lzma.addCSourceFiles(.{
-        .root = xz_tools.path(""),
-        .files = &xz_tools_sources,
-        .flags = &.{"-DHAVE_CONFIG_H"},
-    });
-    for (xz_tools_includes) |xz_include| {
-        lzma.addIncludePath(xz_tools.path(xz_include));
-    }
-    const config_h = b.addConfigHeader(
-        .{ .style = .blank, .include_path = "config.h" },
-        .{
-            .ASSUME_RAM = 128,
-            .HAVE_CHECK_CRC32 = 1,
-            .HAVE_CHECK_CRC64 = 1,
-            .HAVE_CLOCK_GETTIME = 1,
-            .HAVE_CLOCK_MONOTONIC = 1,
-            .HAVE_CPUID_H = 1,
-            .HAVE_DCGETTEXT = 1,
-            .HAVE_DECODERS = 1,
-            .HAVE_DECODER_LZMA1 = 1,
-            .HAVE_DECODER_LZMA2 = 1,
-            .HAVE_DLFCN_H = 1,
-            .HAVE_ENCODERS = 1,
-            .HAVE_ENCODER_LZMA1 = 1,
-            .HAVE_ENCODER_LZMA2 = 1,
-            .HAVE_FUNC_ATTRIBUTE_CONSTRUCTOR = 1,
-            .HAVE_FUTIMENS = 1,
-            .HAVE_GETOPT_H = 1,
-            .HAVE_GETOPT_LONG = 1,
-            .HAVE_GETTEXT = 1,
-            .HAVE_IMMINTRIN_H = 1,
-            .HAVE_INTTYPES_H = 1,
-            .HAVE_LINUX_LANDLOCK = 1,
-            .HAVE_MBRTOWC = 1,
-            .HAVE_MF_BT2 = 1,
-            .HAVE_MF_BT3 = 1,
-            .HAVE_MF_BT4 = 1,
-            .HAVE_MF_HC3 = 1,
-            .HAVE_MF_HC4 = 1,
-            .HAVE_POSIX_FADVISE = 1,
-            .HAVE_STDBOOL_H = 1,
-            .HAVE_STDINT_H = 1,
-            .HAVE_STDIO_H = 1,
-            .HAVE_STDLIB_H = 1,
-            .HAVE_STRINGS_H = 1,
-            .HAVE_STRING_H = 1,
-            .HAVE_STRUCT_STAT_ST_ATIM_TV_NSEC = 1,
-            .HAVE_SYS_CDEFS_H = 1,
-            .HAVE_SYS_PARAM_H = 1,
-            .HAVE_SYS_STAT_H = 1,
-            .HAVE_SYS_TYPES_H = 1,
-            .HAVE_UINTPTR_T = 1,
-            .HAVE_UNISTD_H = 1,
-            .HAVE_USABLE_CLMUL = 1,
-            .HAVE_VISIBILITY = 0,
-            .HAVE__BOOL = 1,
-            .HAVE__MM_MOVEMASK_EPI8 = 1,
-            .NDEBUG = 0,
-            .PACKAGE = "xz",
-            .PACKAGE_BUGREPORT = "xz@tukaani.org",
-            .PACKAGE_NAME = "XZ Utils",
-            .PACKAGE_STRING = "XZ Utils 5.6.3",
-            .PACKAGE_TARNAME = "xz",
-            .PACKAGE_URL = "https://tukaani.org/xz/",
-            .PACKAGE_VERSION = "5.6.3",
-            .SIZEOF_SIZE_T = 8,
-            .STDC_HEADERS = 1,
-            .TUKLIB_FAST_UNALIGNED_ACCESS = 1,
-            .TUKLIB_PHYSMEM_SYSCONF = 1,
-            .VERSION = "5.6.3",
-        },
-    );
-    lzma.addConfigHeader(config_h);
-    lzma.installHeadersDirectory(xz_tools.path("src/liblzma/api"), "", .{});
-    b.installArtifact(lzma);
-
-    const httpz = b.dependency(
-        "httpz",
-        .{
-            .target = target,
-            .optimize = optimize,
-        },
-    );
+    const lzma = buildLibLzma(b, target);
+    const httpz = b.dependency("httpz", .{ .target = target, .optimize = optimize });
 
     const exe = b.addExecutable(.{
         .name = "main",
@@ -184,6 +95,94 @@ pub fn build(b: *std.Build) void {
 
     const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
     test_mwp_step.dependOn(&run_mwp_tests.step);
+}
+
+pub fn buildLibLzma(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
+    const xz_tools = b.dependency("xz_tools", .{});
+
+    const lzma = b.addStaticLibrary(.{
+        .name = "lzma",
+        .link_libc = true,
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    lzma.addCSourceFiles(.{
+        .root = xz_tools.path(""),
+        .files = &xz_tools_sources,
+        .flags = &.{"-DHAVE_CONFIG_H"},
+    });
+    for (xz_tools_includes) |xz_include| {
+        lzma.addIncludePath(xz_tools.path(xz_include));
+    }
+    const config_h = b.addConfigHeader(
+        .{ .style = .blank, .include_path = "config.h" },
+        .{
+            .ASSUME_RAM = 128,
+            .HAVE_CHECK_CRC32 = 1,
+            .HAVE_CHECK_CRC64 = 1,
+            .HAVE_CLOCK_GETTIME = 1,
+            .HAVE_CLOCK_MONOTONIC = 1,
+            .HAVE_CPUID_H = 1,
+            .HAVE_DCGETTEXT = 1,
+            .HAVE_DECODERS = 1,
+            .HAVE_DECODER_LZMA1 = 1,
+            .HAVE_DECODER_LZMA2 = 1,
+            .HAVE_DLFCN_H = 1,
+            .HAVE_ENCODERS = 1,
+            .HAVE_ENCODER_LZMA1 = 1,
+            .HAVE_ENCODER_LZMA2 = 1,
+            .HAVE_FUNC_ATTRIBUTE_CONSTRUCTOR = 1,
+            .HAVE_FUTIMENS = 1,
+            .HAVE_GETOPT_H = 1,
+            .HAVE_GETOPT_LONG = 1,
+            .HAVE_GETTEXT = 1,
+            .HAVE_IMMINTRIN_H = 1,
+            .HAVE_INTTYPES_H = 1,
+            .HAVE_LINUX_LANDLOCK = 1,
+            .HAVE_MBRTOWC = 1,
+            .HAVE_MF_BT2 = 1,
+            .HAVE_MF_BT3 = 1,
+            .HAVE_MF_BT4 = 1,
+            .HAVE_MF_HC3 = 1,
+            .HAVE_MF_HC4 = 1,
+            .HAVE_POSIX_FADVISE = 1,
+            .HAVE_STDBOOL_H = 1,
+            .HAVE_STDINT_H = 1,
+            .HAVE_STDIO_H = 1,
+            .HAVE_STDLIB_H = 1,
+            .HAVE_STRINGS_H = 1,
+            .HAVE_STRING_H = 1,
+            .HAVE_STRUCT_STAT_ST_ATIM_TV_NSEC = 1,
+            .HAVE_SYS_CDEFS_H = 1,
+            .HAVE_SYS_PARAM_H = 1,
+            .HAVE_SYS_STAT_H = 1,
+            .HAVE_SYS_TYPES_H = 1,
+            .HAVE_UINTPTR_T = 1,
+            .HAVE_UNISTD_H = 1,
+            .HAVE_USABLE_CLMUL = 1,
+            .HAVE_VISIBILITY = 0,
+            .HAVE__BOOL = 1,
+            .HAVE__MM_MOVEMASK_EPI8 = 1,
+            .NDEBUG = 0,
+            .PACKAGE = "xz",
+            .PACKAGE_BUGREPORT = "xz@tukaani.org",
+            .PACKAGE_NAME = "XZ Utils",
+            .PACKAGE_STRING = "XZ Utils 5.6.3",
+            .PACKAGE_TARNAME = "xz",
+            .PACKAGE_URL = "https://tukaani.org/xz/",
+            .PACKAGE_VERSION = "5.6.3",
+            .SIZEOF_SIZE_T = 8,
+            .STDC_HEADERS = 1,
+            .TUKLIB_FAST_UNALIGNED_ACCESS = 1,
+            .TUKLIB_PHYSMEM_SYSCONF = 1,
+            .VERSION = "5.6.3",
+        },
+    );
+    lzma.addConfigHeader(config_h);
+    lzma.installHeadersDirectory(xz_tools.path("src/liblzma/api"), "", .{});
+    b.installArtifact(lzma);
+
+    return lzma;
 }
 
 const xz_tools_includes = [_][]const u8{

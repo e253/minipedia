@@ -1,6 +1,7 @@
 /.zig-cache
 /zig-out
 /dump
+src/index.html
 out.minidump
 logs.db
 logs.db.wal

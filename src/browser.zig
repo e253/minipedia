@@ -23,22 +23,16 @@ pub fn main() !void {
 
     var router = server.router();
 
-    router.get("/", home);
     router.get("/wiki/id/:id", serveArticle);
+    router.get("/*", spa);
 
     try server.listen();
 }
 
-fn home(s: State, _: *httpz.Request, res: *httpz.Response) !void {
-    const page_fmt =
-        \\<h1> Minipedia </h1>
-        \\<h4>Search from <em>{}</em> articles</h4>
-        \\<hr>
-        \\
-        \\<p> Navigate to '/wiki/id/&lt;id&gt;' </p>
-    ;
-    res.status = 200;
-    try std.fmt.format(res.writer(), page_fmt, .{s.mdr.articleCount()});
+fn spa(_: State, _: *httpz.Request, res: *httpz.Response) !void {
+    const SPA = @embedFile("index.html");
+    res.content_type = .HTML;
+    res.body = SPA;
 }
 
 fn serveArticle(s: State, req: *httpz.Request, res: *httpz.Response) !void {
