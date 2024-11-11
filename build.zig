@@ -44,13 +44,13 @@ pub fn build(b: *std.Build) void {
     browser.linkLibrary(lzma);
     b.installArtifact(browser);
 
-    const title_search = b.addExecutable(.{
-        .name = "title_search",
-        .root_source_file = b.path("src/title_search.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    b.installArtifact(title_search);
+    //const title_search = b.addExecutable(.{
+    //    .name = "title_search",
+    //    .root_source_file = b.path("src/title_search.zig"),
+    //    .target = target,
+    //    .optimize = optimize,
+    //});
+    //b.installArtifact(title_search);
 
     const wikiparserxml_tests = b.addTest(.{
         .root_source_file = b.path("src/wikixmlparser.zig"),

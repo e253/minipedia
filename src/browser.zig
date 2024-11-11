@@ -2,6 +2,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const stdout = std.io.getStdOut();
 const MinidumpReader = @import("minidump_reader.zig");
+const TitleIndex = @import("title_index.zig");
 
 const c_allocator = std.heap.c_allocator;
 
@@ -10,32 +11,36 @@ const PORT: u16 = 3000;
 
 pub const State = struct {
     mdr: MinidumpReader,
+    ti: TitleIndex,
 };
 
 pub fn main() !void {
     const mdr = try MinidumpReader.init(c_allocator, "./out.minidump");
-    const state = State{ .mdr = mdr };
+    const ti = try TitleIndex.init(c_allocator, "./titles.txt");
+    var state = State{ .mdr = mdr, .ti = ti };
 
-    var server = try httpz.ServerApp(State).init(c_allocator, .{ .address = ADDRESS, .port = PORT }, state);
+    var server = try httpz.ServerApp(*State).init(c_allocator, .{ .address = ADDRESS, .port = PORT }, &state);
     defer server.deinit();
-
+    defer server.stop();
     try std.fmt.format(stdout.writer(), "http://{s}:{}/\n\n", .{ ADDRESS, PORT });
 
+    server.dispatcher(dispatcher);
     var router = server.router();
 
-    router.get("/wiki/id/:id", serveArticle);
+    router.get("/api/article/:id", serveArticle);
+    router.get("/api/search", search);
     router.get("/*", spa);
 
     try server.listen();
 }
 
-fn spa(_: State, _: *httpz.Request, res: *httpz.Response) !void {
+fn spa(_: *State, _: *httpz.Request, res: *httpz.Response) !void {
     const SPA = @embedFile("index.html");
     res.content_type = .HTML;
     res.body = SPA;
 }
 
-fn serveArticle(s: State, req: *httpz.Request, res: *httpz.Response) !void {
+fn serveArticle(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
     const id_str_opt = req.param("id");
     if (id_str_opt == null) {
         res.status = 400;
@@ -57,4 +62,42 @@ fn serveArticle(s: State, req: *httpz.Request, res: *httpz.Response) !void {
         res.status = 404;
         try std.fmt.format(res.writer(), "<h1> No article for id {} </h1>", .{id});
     }
+}
+
+fn search(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
+    const query = try req.query();
+
+    if (query.get("q")) |q| {
+        const limit = blk: {
+            if (query.get("l")) |limit_str| {
+                break :blk std.fmt.parseInt(usize, limit_str, 10) catch {
+                    break :blk null;
+                };
+            }
+            break :blk null;
+        };
+
+        s.ti.lock();
+        defer s.ti.unlock();
+        try s.ti.search(q, limit);
+
+        try std.json.stringify(s.ti.matches.items, .{}, res.writer());
+    } else {
+        std.debug.print("No q!", .{});
+        res.content_type = .JSON;
+        res.body = "[]";
+    }
+}
+
+fn dispatcher(s: *State, action: httpz.Action(*State), req: *httpz.Request, res: *httpz.Response) !void {
+    var timer = std.time.Timer.start() catch @panic("Gettime systcall failed in logger");
+
+    std.log.info("<-- {s} {s}?{s}", .{ @tagName(req.method), req.url.path, req.url.query });
+
+    defer {
+        const elapsed = timer.read() / 1_000_000; // ns --> ms
+        std.log.info("--> {s} {s}?{s} {d} {d}ms", .{ @tagName(req.method), req.url.path, req.url.query, res.status, elapsed });
+    }
+
+    return action(s, req, res);
 }
