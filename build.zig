@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -7,6 +8,33 @@ pub fn build(b: *std.Build) void {
     const rxml = b.dependency("rapidxml", .{});
     const lzma = buildLibLzma(b, target);
     const httpz = b.dependency("httpz", .{ .target = target, .optimize = optimize });
+    const stringzilla_dep = b.dependency("stringzilla", .{});
+
+    const stringzilla = b.addStaticLibrary(.{
+        .name = "stringzilla",
+        .root_source_file = b.path("src/stringzilla.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_model = .{
+                .explicit = &.{
+                    .name = "ivybridge+evex512",
+                    .llvm_name = "ivybridge+evex512",
+                    .features = std.Target.Cpu.Feature.Set.empty,
+                },
+            },
+        }),
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    stringzilla.addIncludePath(stringzilla_dep.path("include"));
+    switch (target.result.cpu.arch) {
+        .x86, .x86_64 => stringzilla.addCSourceFile(.{ .file = stringzilla_dep.path("c/lib.c"), .flags = &.{
+            "-DSZ_USE_X86_AVX2=1",
+            "-DSZ_USE_X86_AVX512=1",
+            "-DSZ_USE_X86_NEON=0",
+            "-DSZ_USE_X86_SVE=0",
+        } }),
+        else => @panic("Only X86 supported for stringzilla"),
+    }
 
     const exe = b.addExecutable(.{
         .name = "main",
@@ -42,15 +70,16 @@ pub fn build(b: *std.Build) void {
     browser.root_module.addImport("httpz", httpz.module("httpz"));
     browser.linkLibC();
     browser.linkLibrary(lzma);
+    browser.linkLibrary(stringzilla);
     b.installArtifact(browser);
 
-    //const title_search = b.addExecutable(.{
-    //    .name = "title_search",
-    //    .root_source_file = b.path("src/title_search.zig"),
-    //    .target = target,
-    //    .optimize = optimize,
-    //});
-    //b.installArtifact(title_search);
+    const create_search = b.addExecutable(.{
+        .name = "create_search",
+        .root_source_file = b.path("src/create_search.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(create_search);
 
     const wikiparserxml_tests = b.addTest(.{
         .root_source_file = b.path("src/wikixmlparser.zig"),
@@ -95,6 +124,13 @@ pub fn build(b: *std.Build) void {
 
     const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
     test_mwp_step.dependOn(&run_mwp_tests.step);
+}
+
+fn have_x86_feat(t: std.Target, feat: std.Target.x86.Feature) bool {
+    return switch (t.cpu.arch) {
+        .x86, .x86_64 => std.Target.x86.featureSetHas(t.cpu.features, feat),
+        else => false,
+    };
 }
 
 pub fn buildLibLzma(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {

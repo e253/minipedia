@@ -16,7 +16,7 @@ pub const State = struct {
 
 pub fn main() !void {
     const mdr = try MinidumpReader.init(c_allocator, "./out.minidump");
-    const ti = try TitleIndex.init(c_allocator, "./titles.txt");
+    const ti = try TitleIndex.init("./out.index");
     var state = State{ .mdr = mdr, .ti = ti };
 
     var server = try httpz.ServerApp(*State).init(c_allocator, .{ .address = ADDRESS, .port = PORT }, &state);
@@ -64,24 +64,36 @@ fn serveArticle(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
     }
 }
 
+/// searches for query param `q`
+///
+/// Returns at most `l` matches (`1 <= l <= 20`)
 fn search(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
     const query = try req.query();
 
     if (query.get("q")) |q| {
         const limit = blk: {
             if (query.get("l")) |limit_str| {
-                break :blk std.fmt.parseInt(usize, limit_str, 10) catch {
-                    break :blk null;
+                const limit = std.fmt.parseInt(usize, limit_str, 10) catch {
+                    break :blk 10;
                 };
+                if (limit < 1) {
+                    break :blk 1;
+                } else if (limit > 20) {
+                    break :blk 20;
+                } else {
+                    break :blk limit;
+                }
             }
-            break :blk null;
+            break :blk 10;
         };
 
-        s.ti.lock();
-        defer s.ti.unlock();
-        try s.ti.search(q, limit);
+        var matches_buf: [20]TitleIndex.Match = undefined;
+        var matches = matches_buf[0..limit];
+        var matches_str_buf: [256 * 20]u8 = undefined;
 
-        try std.json.stringify(s.ti.matches.items, .{}, res.writer());
+        try s.ti.search(q, limit, &matches, &matches_str_buf);
+
+        try std.json.stringify(matches, .{}, res.writer());
     } else {
         std.debug.print("No q!", .{});
         res.content_type = .JSON;

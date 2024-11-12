@@ -12,6 +12,10 @@
             .url = "https://github.com/tukaani-project/xz/archive/refs/tags/v5.6.3.tar.gz",
             .hash = "122064f114c207a48c75c9208e6f2e5da19edc13778eb54ac87177b1bebef7c544f1",
         },
+        .stringzilla = .{
+            .url = "https://github.com/ashvardanian/StringZilla/archive/refs/tags/v3.10.9.tar.gz",
+            .hash = "122092c16abdf3800affae4b16c8335e350bc89c793da66d578acd62484a331b2242",
+        },
         .httpz = .{
             .url = "https://github.com/karlseguin/http.zig/archive/7d2ddae87af9b110783085c0ea6b03985faa4584.tar.gz",
             .hash = "12208c1f2c5f730c4c03aabeb0632ade7e21914af03e6510311b449458198d0835d6",
