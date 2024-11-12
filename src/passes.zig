@@ -39,7 +39,7 @@ pub fn removeReferences(n: *MWAstNode) !void {
 /// 1. All html tag names and attribute names are lowercased.
 ///
 /// 2. Template names and argument names are lowered.
-pub fn cleanAST(n: *MWAstNode) !void {
+pub fn cleanAST(n: *MWAstNode) Error!void {
     std.debug.assert(n.nodeType() == .document);
 
     try wmp.traverse(n, .html_tag, ?usize, Error, lowerHtmlTagNameAndAttributes, null);
@@ -124,19 +124,22 @@ pub fn renderHtmlTagToMarkdown(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!vo
     const htag = try n.asHtmlTag();
     const tag_name = htag.tag_name;
     if (eq(u8, "math", tag_name)) {
-        // TODO: throw error
-        const latex_src = try n.first_child.?.asText();
-        const buf_size = latex_src.len + "$$".len;
+        if (n.first_child) |fc| {
+            const latex_src = try fc.asText();
+            const buf_size = "$".len + latex_src.len + "$".len;
 
-        const buf = try a.alloc(u8, buf_size);
-        var buf_strm = std.io.fixedBufferStream(buf);
-        const buf_wr = buf_strm.writer();
+            const buf = try a.alloc(u8, buf_size);
+            var buf_strm = std.io.fixedBufferStream(buf);
+            const buf_wr = buf_strm.writer();
 
-        try buf_wr.writeAll("$");
-        try buf_wr.writeAll(latex_src);
-        try buf_wr.writeAll("$");
+            try buf_wr.writeAll("$");
+            try buf_wr.writeAll(latex_src);
+            try buf_wr.writeAll("$");
 
-        n.*.n = .{ .text = buf };
+            n.*.n = .{ .text = buf };
+        } else {
+            n.*.n = .{ .text = "" };
+        }
     } else if (eq(u8, "nowiki", tag_name)) {
         if (n.first_child) |fc| {
             n.*.n = .{ .text = try fc.asText() };
@@ -180,13 +183,11 @@ pub fn renderHtmlTagToMarkdown(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!vo
     }
 }
 
-pub fn renderHtmlEntity(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!void {
-    _ = a;
+pub fn renderHtmlEntity(n: *wmp.MWAstNode, _: std.mem.Allocator) Error!void {
     n.*.n = .{ .text = try n.asHtmlEntity() };
 }
 
-pub fn renderTemplateToMarkdown(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!void {
-    _ = a;
+pub fn renderTemplateToMarkdown(n: *wmp.MWAstNode, _: std.mem.Allocator) Error!void {
     n.*.n = .{ .text = "" };
 }
 
@@ -219,27 +220,21 @@ pub fn renderWikiLinkToMarkdown(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!v
 
     switch (wl.namespace) {
         .Main, .Wikitionary => {
-            // TODO: log this more efficiently
-            //if (n.n_children > 1) {
-            //    std.debug.print("Link with {} children\n", .{n.n_children});
-            //}
-
-            var buf_size: usize = "[[]]".len + wl.article.len;
-            if (wl.namespace == .Wikitionary)
-                buf_size += "wikt:".len;
+            const ns_str = wl.namespace.toStr();
+            var buf_size: usize = "[[]]".len + ns_str.len + wl.article.len;
 
             const caption_arg_node_opt = n.last_child;
             if (caption_arg_node_opt) |caption_arg_node| {
-                std.debug.assert(caption_arg_node.n_children > 0);
+                if (caption_arg_node.n_children > 0) {
+                    buf_size += "|".len;
 
-                buf_size += "|".len;
-
-                var it = caption_arg_node.first_child;
-                while (it) |child| : (it = child.next) {
-                    try toText(a, child);
-                    switch (child.n) {
-                        .text => |txt| buf_size += txt.len,
-                        else => continue,
+                    var it = caption_arg_node.first_child;
+                    while (it) |child| : (it = child.next) {
+                        try toText(a, child);
+                        switch (child.n) {
+                            .text => |txt| buf_size += txt.len,
+                            else => continue,
+                        }
                     }
                 }
             }
@@ -249,19 +244,19 @@ pub fn renderWikiLinkToMarkdown(n: *wmp.MWAstNode, a: std.mem.Allocator) Error!v
             const buf_wrtr = buf_strm.writer();
 
             try buf_wrtr.writeAll("[[");
-            if (wl.namespace == .Wikitionary)
-                try buf_wrtr.writeAll("wikt:");
+            try buf_wrtr.writeAll(ns_str);
             try buf_wrtr.writeAll(wl.article);
 
-            const caption_arg_node_opt2 = n.last_child;
-            if (caption_arg_node_opt2) |caption_arg_node| {
-                try buf_wrtr.writeByte('|');
+            if (caption_arg_node_opt) |caption_arg_node| {
+                if (caption_arg_node.n_children > 0) {
+                    try buf_wrtr.writeByte('|');
 
-                var it = caption_arg_node.first_child;
-                while (it) |child| : (it = child.next) {
-                    switch (child.n) {
-                        .text => |txt| try buf_wrtr.writeAll(txt),
-                        else => continue,
+                    var it = caption_arg_node.first_child;
+                    while (it) |child| : (it = child.next) {
+                        switch (child.n) {
+                            .text => |txt| try buf_wrtr.writeAll(txt),
+                            else => continue,
+                        }
                     }
                 }
             }

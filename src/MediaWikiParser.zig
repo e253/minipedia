@@ -27,6 +27,14 @@ pub const WikiLink = struct {
                 return .Unknown;
             }
         }
+        pub fn toStr(n: Namepace) []const u8 {
+            switch (n) {
+                .Main, .Unknown => return "",
+                .File => return "File",
+                .Image => return "Image",
+                .Wikitionary => return "Wikitionary",
+            }
+        }
     };
 
     /// Actual article to link to

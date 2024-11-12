@@ -25,16 +25,16 @@ pub fn main() !void {
     var titlesBW = std.io.bufferedWriter(titles_file.writer());
     const titles = titlesBW.writer();
 
-    const fbaBuffer = try c_allocator.alloc(u8, 4096 * 256);
+    const fbaBuffer = try c_allocator.alloc(u8, 4096 * 2048);
     defer c_allocator.free(fbaBuffer);
     var fba = std.heap.FixedBufferAllocator.init(fbaBuffer);
     const fbaAlloc = fba.allocator();
 
-    const page_buffer = try c_allocator.alloc(u8, 4096 * 256);
+    const page_buffer = try c_allocator.alloc(u8, 4096 * 2048);
     defer c_allocator.free(page_buffer);
 
     // Initialize DuckDB tracing.
-    var duckTrace = try DuckTrace(mwp.Error).init("logs.db");
+    var duckTrace = try DuckTrace.init("logs.db");
 
     // Write 15MB of 0s
     const tmp_zero_buf = try fbaAlloc.alloc(u8, 100_000);
@@ -85,13 +85,19 @@ pub fn main() !void {
 
         const preProcessedArticle = try preprocessArticle(alloc, wikiArticle.article);
 
-        var duckTraceDocInstance = duckTrace.newInstance(document_id, preProcessedArticle);
-        const processedArticle = wikicodeToMarkdown(alloc, preProcessedArticle, &duckTraceDocInstance) catch blk: {
+        var duckTraceDocInstance = duckTrace.newInstance(document_id, preProcessedArticle, mwp.Error);
+        var duckTraceGenInstance = duckTrace.newInstance(document_id, "", passes.Error);
+        duckTraceGenInstance.section = .Parsing;
+        const processedArticle = wikicodeToMarkdown(alloc, preProcessedArticle, &duckTraceDocInstance, &duckTraceGenInstance) catch blk: {
             stats.n_articles_failed_parsing += 1;
             break :blk preProcessedArticle;
         };
 
         const size_to_write = processedArticle.len + wikiArticle.title.len + @sizeOf(usize) + "# ".len + "\n".len + "0".len;
+
+        if (size_to_write > lzma_block_size_limit) {
+            @panic("Article larger than 1MB found!");
+        }
 
         // block is full! compress contents and flush them out
         // add a block_offset to the array
@@ -209,22 +215,30 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
 }
 
 /// Uses `mwp.parseDocument` to convert Wikicode AST to more concise and clean text
-fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8, t: anytype) ![]const u8 {
-    var doc = try mwp.parseDocument(a, raw_wikitext, t);
+fn wikicodeToMarkdown(a: std.mem.Allocator, raw_wikitext: []const u8, parse_tracer: anytype, gen_tracer: anytype) ![]const u8 {
+    var doc = try mwp.parseDocument(a, raw_wikitext, parse_tracer);
 
-    try passes.cleanAST(&doc);
+    passes.cleanAST(&doc) catch |err| {
+        return gen_tracer.err(err);
+    };
 
-    try passes.removeReferences(&doc);
+    passes.removeReferences(&doc) catch |err| {
+        return gen_tracer.err(err);
+    };
 
-    try passes.toText(a, &doc);
+    passes.toText(a, &doc) catch |err| {
+        return gen_tracer.err(err);
+    };
 
     const out = try a.alloc(u8, try passes.textSize(&doc));
     var out_strm = std.io.fixedBufferStream(out);
     const out_wtr = out_strm.writer();
 
-    try passes.writeText(&doc, out_wtr);
+    passes.writeText(&doc, out_wtr) catch |err| {
+        return gen_tracer.err(err);
+    };
 
-    try t.success();
+    try gen_tracer.success();
     return out;
 }
 
