@@ -50,7 +50,7 @@ pub fn search(s: *Self, query: []const u8, limit: usize, matches: *[]Match, matc
     var matches_found: usize = 0;
     var last_match_pos: usize = 0;
     while (matches_found < limit) {
-        if (sz.indexOfPos(s.map, query, last_match_pos)) |pos| {
+        if (sz.indexOfCaseInsensitivePos(s.map, query, last_match_pos)) |pos| {
             const title_start = (std.mem.lastIndexOfScalar(u8, s.map[0..pos], 0) orelse @panic("Title not preceeded by \\0")) + 1;
             const title_end = std.mem.indexOfScalarPos(u8, s.map, pos, 0) orelse @panic("Title not null terminated");
 

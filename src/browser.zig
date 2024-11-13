@@ -71,6 +71,13 @@ fn search(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
     const query = try req.query();
 
     if (query.get("q")) |q| {
+        if (q.len > 256) {
+            res.content_type = .TEXT;
+            res.body = "Query must be less than 256 characters.";
+            res.status = 400;
+            return;
+        }
+
         const limit = blk: {
             if (query.get("l")) |limit_str| {
                 const limit = std.fmt.parseInt(usize, limit_str, 10) catch {
@@ -95,14 +102,13 @@ fn search(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
 
         try std.json.stringify(matches, .{}, res.writer());
     } else {
-        std.debug.print("No q!", .{});
         res.content_type = .JSON;
         res.body = "[]";
     }
 }
 
 fn dispatcher(s: *State, action: httpz.Action(*State), req: *httpz.Request, res: *httpz.Response) !void {
-    var timer = std.time.Timer.start() catch @panic("Gettime systcall failed in logger");
+    var timer = std.time.Timer.start() catch @panic("Gettime syscall failed in logger");
 
     std.log.info("<-- {s} {s}?{s}", .{ @tagName(req.method), req.url.path, req.url.query });
 

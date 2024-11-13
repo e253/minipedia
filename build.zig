@@ -8,7 +8,6 @@ pub fn build(b: *std.Build) void {
     const rxml = b.dependency("rapidxml", .{});
     const lzma = buildLibLzma(b, target);
     const httpz = b.dependency("httpz", .{ .target = target, .optimize = optimize });
-    const stringzilla_dep = b.dependency("stringzilla", .{});
 
     const stringzilla = b.addStaticLibrary(.{
         .name = "stringzilla",
@@ -22,18 +21,25 @@ pub fn build(b: *std.Build) void {
                 },
             },
         }),
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
         .link_libc = true,
     });
-    stringzilla.addIncludePath(stringzilla_dep.path("include"));
+    stringzilla.addIncludePath(b.path("src"));
     switch (target.result.cpu.arch) {
-        .x86, .x86_64 => stringzilla.addCSourceFile(.{ .file = stringzilla_dep.path("c/lib.c"), .flags = &.{
+        .x86, .x86_64 => stringzilla.addCSourceFile(.{ .file = b.path("src/stringzilla.c"), .flags = &.{
+            "-DSZ_AVOID_LIBC=1",
             "-DSZ_USE_X86_AVX2=1",
             "-DSZ_USE_X86_AVX512=1",
             "-DSZ_USE_X86_NEON=0",
             "-DSZ_USE_X86_SVE=0",
         } }),
-        else => @panic("Only X86 supported for stringzilla"),
+        .arm, .aarch64 => stringzilla.addCSourceFile(.{ .file = b.path("src/stringzilla.c"), .flags = &.{
+            "-DSZ_USE_X86_AVX2=0",
+            "-DSZ_USE_X86_AVX512=0",
+            "-DSZ_USE_X86_NEON=1",
+            "-DSZ_USE_X86_SVE=1",
+        } }),
+        else => @panic("Only X86/Arm supported for stringzilla"),
     }
 
     const exe = b.addExecutable(.{
