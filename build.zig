@@ -122,11 +122,28 @@ pub fn build(b: *std.Build) void {
     });
     const run_mwp_tests = b.addRunArtifact(mwp_tests);
 
+    const minisearch_tests = b.addTest(.{
+        .root_source_file = b.path("src/minisearch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    minisearch_tests.addIncludePath(b.path("./search"));
+    if (optimize == .Debug) {
+        minisearch_tests.addLibraryPath(b.path("./search/target/debug"));
+    } else {
+        minisearch_tests.addLibraryPath(b.path("./search/target/release"));
+    }
+    minisearch_tests.linkSystemLibrary("minisearch");
+    minisearch_tests.linkSystemLibrary("unwind");
+    minisearch_tests.linkLibC();
+    const run_minisearch_tests = b.addRunArtifact(minisearch_tests);
+
     const test_step = b.step("test", "Run All Unit Tests");
     test_step.dependOn(&run_wikiparserxml_tests.step);
     test_step.dependOn(&run_slice_array_tests.step);
     test_step.dependOn(&run_lzma_binding_tests.step);
     test_step.dependOn(&run_mwp_tests.step);
+    test_step.dependOn(&run_minisearch_tests.step);
 
     const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
     test_mwp_step.dependOn(&run_mwp_tests.step);

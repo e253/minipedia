@@ -1,7 +1,12 @@
 [package]
-name = "minipedia-search"
+name = "minisearch"
 version = "0.1.0"
 edition = "2021"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
 
 [lib]
 crate-type = ["staticlib"]
