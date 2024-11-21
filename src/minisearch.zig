@@ -39,15 +39,28 @@ const rs = struct {
         title_buf: [*]u8,
     ) usize;
 
+    /// Checks if document with `title` exists in the index.
+    /// Only exact matches are given
+    extern fn ms_doc_id_from_title(
+        state: *const rs.Ctx,
+        title: [*]const u8,
+        title_len: usize,
+    ) usize;
+
     /// Closes
     extern fn ms_deinit(c: *const Ctx) void;
 };
 
 const Minisearch = @This();
-pub const Result = rs.Result;
-
 internal: rs.Ctx,
 
+pub const MAX_TITLE_SIZE = 256;
+pub const Result = struct {
+    title: []const u8,
+    id: usize,
+};
+
+/// Initializes tantivy index
 pub fn init(index_dir: []const u8) Minisearch {
     var internal_ctx: rs.Ctx = .{};
 
@@ -56,22 +69,44 @@ pub fn init(index_dir: []const u8) Minisearch {
     return .{ .internal = internal_ctx };
 }
 
-pub fn deinit(self: *const Minisearch) void {
+/// Close tantivy index
+pub fn deinit(self: Minisearch) void {
     rs.ms_deinit(&self.internal);
 }
 
+/// **`a` must be an arena!**
 pub fn search(
-    self: *const Minisearch,
+    self: Minisearch,
+    a: std.mem.Allocator,
     query: []const u8,
     limit: usize,
     offset: usize,
-    results: *[]Result,
-    title_buf: []u8,
-) void {
-    std.debug.assert(results.len >= limit);
-    std.debug.assert(title_buf.len >= limit * 256);
+) ![]const Result {
+    var c_results = try a.alloc(rs.Result, limit);
+    const storage = try a.alloc(u8, limit * MAX_TITLE_SIZE);
 
-    const n_results = rs.ms_search(&self.internal, query.ptr, query.len, limit, offset, results.ptr, title_buf.ptr);
+    c_results.len = rs.ms_search(&self.internal, query.ptr, query.len, limit, offset, c_results.ptr, storage.ptr);
 
-    results.len = n_results;
+    const results = try a.alloc(Result, limit);
+
+    for (c_results, 0..) |cres, i| {
+        results[i] = .{
+            .title = cres.title(),
+            .id = cres.doc_id,
+        };
+    }
+
+    return results;
+}
+
+/// gets document id from title
+///
+/// `title` must be an exact match
+pub fn doc(self: Minisearch, title: []const u8) ?usize {
+    const id = rs.ms_doc_id_from_title(&self.internal, title.ptr, title.len);
+    if (id == std.math.maxInt(usize)) {
+        return null;
+    } else {
+        return id;
+    }
 }

@@ -2,8 +2,8 @@ use core::str;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::OwnedValue;
+use tantivy::query::{PhraseQuery, Query, QueryParser, TermQuery};
+use tantivy::schema::{IndexRecordOption, OwnedValue};
 use tantivy::{Index, IndexReader, TantivyDocument};
 
 #[repr(C)]
@@ -107,6 +107,72 @@ pub extern "C" fn ms_search(
     }
 
     results.len()
+}
+
+#[no_mangle]
+pub extern "C" fn ms_doc_id_from_title(
+    state: *const State,
+    title: *const u8,
+    title_len: usize,
+) -> usize {
+    const NOT_FOUND: usize = usize::MAX;
+
+    assert!(!state.is_null());
+    if title_len == 0 {
+        return NOT_FOUND;
+    }
+
+    let (index, reader) = unsafe { parts_from_state(state) };
+    let schema = index.schema();
+    let title_field = schema.find_field("title").unwrap().0;
+    let searcher = reader.searcher();
+
+    let title = unsafe { str::from_utf8_unchecked(std::slice::from_raw_parts(title, title_len)) };
+
+    let mut title_tokenizer = index.tokenizer_for_field(title_field).unwrap();
+    let mut token_strm = title_tokenizer.token_stream(title);
+    let mut terms: Vec<tantivy::Term> = vec![];
+
+    while let Some(tok) = token_strm.next() {
+        terms.push(tantivy::Term::from_field_text(title_field, &tok.text));
+    }
+
+    if terms.len() == 0 {
+        return NOT_FOUND;
+    }
+
+    let query: Box<dyn Query> = if terms.len() < 2 {
+        Box::new(TermQuery::new(terms[0].clone(), IndexRecordOption::Basic)) as Box<dyn Query>
+    } else {
+        Box::new(PhraseQuery::new(terms)) as Box<dyn Query>
+    };
+
+    let results = searcher
+        .search(&query, &TopDocs::with_limit(2))
+        .expect("Query for doc id by title");
+
+    if results.len() != 1 {
+        return NOT_FOUND;
+    }
+
+    let result_doc = searcher.doc::<TantivyDocument>(results[0].1).unwrap();
+
+    let field_values = result_doc.field_values();
+    let matched_title = match &field_values[1].value {
+        OwnedValue::Str(s) => s,
+        _ => panic!("Non string field found in pos 1 of field values"),
+    };
+
+    if matched_title != title {
+        return NOT_FOUND;
+    }
+
+    let doc_id = match &field_values[0].value {
+        OwnedValue::U64(id) => id,
+        _ => panic!("Non u64 field found in pos 0 of field values"),
+    };
+
+    doc_id.clone() as usize
 }
 
 #[no_mangle]

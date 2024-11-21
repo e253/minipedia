@@ -52,6 +52,8 @@ fn main() -> tantivy::Result<()> {
     Ok(())
 }
 
+const MAX_TITLE_LEN: usize = 256;
+
 // ****************
 // From tantivy-cli
 // ****************
@@ -70,8 +72,14 @@ fn run_index(
     thread::spawn(move || {
         let articles = document_source.read().unwrap();
         for (id, article_line_res) in articles.lines().enumerate() {
-            let title = article_line_res.unwrap();
-            // TODO: sub HTML ENTITIES for chars
+            let title = article_line_res
+                .unwrap()
+                .replace("&amp;", "&")
+                .replace("&quot;", "\"");
+            if title.len() > MAX_TITLE_LEN {
+                eprintln!("Title: '{}' has len {}", title, title.len());
+                panic!("Encountered title longer than MAX_TITLE_LEN")
+            }
             line_sender.send((id, title)).unwrap();
         }
     });

@@ -2,26 +2,36 @@ const std = @import("std");
 const httpz = @import("httpz");
 const stdout = std.io.getStdOut();
 const MinidumpReader = @import("minidump_reader.zig");
-const TitleIndex = @import("title_index.zig");
+const Minisearch = @import("minisearch.zig");
 
 const c_allocator = std.heap.c_allocator;
 
 const ADDRESS = "127.0.0.1";
 const PORT: u16 = 3000;
 
-pub const State = struct {
-    mdr: MinidumpReader,
-    ti: TitleIndex,
+const State = struct {
+    reader: MinidumpReader,
+    search: Minisearch,
 };
 
-pub fn main() !void {
-    const mdr = try MinidumpReader.init(c_allocator, "./out.minidump");
-    const ti = try TitleIndex.init("./out.index");
-    var state = State{ .mdr = mdr, .ti = ti };
+var server_instance: ?*httpz.ServerCtx(State, State) = null;
 
-    var server = try httpz.ServerApp(*State).init(c_allocator, .{ .address = ADDRESS, .port = PORT }, &state);
+pub fn main() !void {
+    try registerCleanShutdown();
+
+    const reader = try MinidumpReader.init(c_allocator, "./out.minidump");
+    defer reader.deinit();
+    const minisearch = Minisearch.init("./search_index");
+    defer minisearch.deinit();
+
+    const state: State = .{
+        .reader = reader,
+        .search = minisearch,
+    };
+
+    var server = try httpz.ServerApp(State).init(c_allocator, .{ .address = ADDRESS, .port = PORT }, state);
     defer server.deinit();
-    defer server.stop();
+    server_instance = &server;
     try std.fmt.format(stdout.writer(), "http://{s}:{}/\n\n", .{ ADDRESS, PORT });
 
     server.dispatcher(dispatcher);
@@ -34,18 +44,43 @@ pub fn main() !void {
     try server.listen();
 }
 
-fn spa(_: *State, _: *httpz.Request, res: *httpz.Response) !void {
+fn registerCleanShutdown() !void {
+    try std.posix.sigaction(std.posix.SIG.INT, &.{
+        .handler = .{ .handler = shutdown },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    }, null);
+    try std.posix.sigaction(std.posix.SIG.TERM, &.{
+        .handler = .{ .handler = shutdown },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    }, null);
+}
+
+var shutdown_lock = std.Thread.Mutex{};
+fn shutdown(_: c_int) callconv(.C) void {
+    if (shutdown_lock.tryLock()) {
+        defer shutdown_lock.unlock();
+        if (server_instance) |server| {
+            server.stop();
+            server_instance = null;
+            std.io.getStdIn().writeAll("\rBye!\n") catch {};
+        }
+    }
+}
+
+fn spa(_: State, _: *httpz.Request, res: *httpz.Response) !void {
     const SPA = @embedFile("index.html");
     res.content_type = .HTML;
     res.body = SPA;
 }
 
-fn serveArticle(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
+fn serveArticle(s: State, req: *httpz.Request, res: *httpz.Response) !void {
     const id_str_opt = req.param("id");
     if (id_str_opt == null) {
         res.status = 400;
         res.body =
-            \\<h1> No article id found </h1>
+            \\<h1> No article id provided </h1>
         ;
         return;
     }
@@ -55,7 +90,7 @@ fn serveArticle(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
         return;
     };
 
-    if (try s.mdr.markdown(id)) |markdown| {
+    if (try s.reader.markdown(id)) |markdown| {
         res.status = 200;
         res.body = markdown;
     } else {
@@ -67,7 +102,7 @@ fn serveArticle(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
 /// searches for query param `q`
 ///
 /// Returns at most `l` matches (`1 <= l <= 20`)
-fn search(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
+fn search(s: State, req: *httpz.Request, res: *httpz.Response) !void {
     const query = try req.query();
 
     if (query.get("q")) |q| {
@@ -94,27 +129,31 @@ fn search(s: *State, req: *httpz.Request, res: *httpz.Response) !void {
             break :blk 10;
         };
 
-        var matches_buf: [20]TitleIndex.Match = undefined;
-        var matches = matches_buf[0..limit];
-        var matches_str_buf: [256 * 20]u8 = undefined;
+        const results = try s.search.search(res.arena, q, limit, 0);
 
-        try s.ti.search(q, limit, &matches, &matches_str_buf);
-
-        try std.json.stringify(matches, .{}, res.writer());
+        try std.json.stringify(results, .{}, res.writer());
     } else {
         res.content_type = .JSON;
         res.body = "[]";
     }
 }
 
-fn dispatcher(s: *State, action: httpz.Action(*State), req: *httpz.Request, res: *httpz.Response) !void {
+fn dispatcher(s: State, action: httpz.Action(State), req: *httpz.Request, res: *httpz.Response) !void {
     var timer = std.time.Timer.start() catch @panic("Gettime syscall failed in logger");
 
-    std.log.info("<-- {s} {s}?{s}", .{ @tagName(req.method), req.url.path, req.url.query });
+    if (req.url.query.len == 0) {
+        std.log.info("<-- {s} {s}", .{ @tagName(req.method), req.url.path });
+    } else {
+        std.log.info("<-- {s} {s}?{s}", .{ @tagName(req.method), req.url.path, req.url.query });
+    }
 
     defer {
         const elapsed = timer.read() / 1_000_000; // ns --> ms
-        std.log.info("--> {s} {s}?{s} {d} {d}ms", .{ @tagName(req.method), req.url.path, req.url.query, res.status, elapsed });
+        if (req.url.query.len == 0) {
+            std.log.info("--> {s} {s} {d} {d}ms", .{ @tagName(req.method), req.url.path, res.status, elapsed });
+        } else {
+            std.log.info("--> {s} {s}?{s} {d} {d}ms", .{ @tagName(req.method), req.url.path, req.url.query, res.status, elapsed });
+        }
     }
 
     return action(s, req, res);

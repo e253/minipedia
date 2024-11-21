@@ -76,16 +76,8 @@ pub fn build(b: *std.Build) void {
     browser.root_module.addImport("httpz", httpz.module("httpz"));
     browser.linkLibC();
     browser.linkLibrary(lzma);
-    browser.linkLibrary(stringzilla);
+    linkMinisearch(b, browser, optimize);
     b.installArtifact(browser);
-
-    const create_search = b.addExecutable(.{
-        .name = "create_search",
-        .root_source_file = b.path("src/create_search.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    b.installArtifact(create_search);
 
     const wikiparserxml_tests = b.addTest(.{
         .root_source_file = b.path("src/wikixmlparser.zig"),
@@ -127,14 +119,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    minisearch_tests.addIncludePath(b.path("./search"));
-    if (optimize == .Debug) {
-        minisearch_tests.addLibraryPath(b.path("./search/target/debug"));
-    } else {
-        minisearch_tests.addLibraryPath(b.path("./search/target/release"));
-    }
-    minisearch_tests.linkSystemLibrary("minisearch");
-    minisearch_tests.linkSystemLibrary("unwind");
+    linkMinisearch(b, minisearch_tests, optimize);
     minisearch_tests.linkLibC();
     const run_minisearch_tests = b.addRunArtifact(minisearch_tests);
 
@@ -147,6 +132,17 @@ pub fn build(b: *std.Build) void {
 
     const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
     test_mwp_step.dependOn(&run_mwp_tests.step);
+}
+
+pub fn linkMinisearch(b: *std.Build, step: *std.Build.Step.Compile, opt: std.builtin.OptimizeMode) void {
+    step.addIncludePath(b.path("./search"));
+    if (opt == .Debug) {
+        step.addLibraryPath(b.path("./search/target/debug"));
+    } else {
+        step.addLibraryPath(b.path("./search/target/release"));
+    }
+    step.linkSystemLibrary("minisearch");
+    step.linkSystemLibrary("unwind");
 }
 
 fn have_x86_feat(t: std.Target, feat: std.Target.x86.Feature) bool {
