@@ -54,6 +54,8 @@ pub extern "C" fn ms_search(
     mut title_buf: *mut u8,
 ) -> usize {
     assert!(!results_buf.is_null());
+    assert!(!query.is_null());
+    assert!(query_len > 0);
 
     let (index, reader) = unsafe { parts_from_state(s) };
     let schema = index.schema();

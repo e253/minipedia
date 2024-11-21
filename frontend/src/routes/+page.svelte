@@ -7,28 +7,36 @@
 
     let results: { title: string; id: number }[] = $state([]);
     let input = $state("");
-    let awaiting_response = false;
+    let abort_controller: AbortController | null = null;
     $effect(() => {
-        if (!awaiting_response) {
-            // So the compiler knows input is a dependency of this effect
-            console.log("Sending request on query", input);
-            awaiting_response = true;
-            setTimeout(async () => {
-                const res = await fetch(`/api/search?q=${input}&l=10`);
+        if (abort_controller != null) {
+            abort_controller.abort();
+        }
+
+        abort_controller = new AbortController();
+        const signal = abort_controller.signal;
+
+        const query = input;
+        fetch(`/api/search?q=${query}&l=10`, { signal })
+            .then((res) => {
+                abort_controller = null;
                 if (!res.ok) {
-                    // TODO: Fire error modal when search fails.
                     console.log(
                         "Fetch for search results failed with code",
                         res.status,
                     );
                 } else {
-                    results = await res.json();
+                    res.json()
+                        .then((v) => (results = v))
+                        .catch((reason) =>
+                            console.log(
+                                "JSON parse of search results failed:",
+                                reason,
+                            ),
+                        );
                 }
-                awaiting_response = false;
-            }, 250);
-        } else {
-            console.log("Not sending request for ", input);
-        }
+            })
+            .catch((reason) => console.log("Fetch had exception", reason));
     });
 </script>
 
@@ -73,7 +81,7 @@
         <hr class="neutral-200" />
 
         {#each results as result}
-            <a href="/wiki/{result.id}">
+            <a href="/wiki/{result.id}" data-sveltekit-preload-data="false">
                 <div
                     class="grid grid-cols-8 auto-rows-auto p-1 h-10 rounded-lg hover:bg-neutral-200"
                 >

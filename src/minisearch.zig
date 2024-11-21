@@ -28,7 +28,9 @@ const rs = struct {
     ///
     /// `results_buf` should be length `limit`
     ///
-    /// `title_buf` should be length `limit * 256`
+    /// `title_buf` should be length `limit * MAX_TITLE_SIZE`
+    ///
+    /// **Asserts `limit > 0` and `query_len > 0`**
     extern fn ms_search(
         c: *const Ctx,
         query: [*]const u8,
@@ -82,6 +84,10 @@ pub fn search(
     limit: usize,
     offset: usize,
 ) ![]const Result {
+    if (limit == 0 or query.len == 0) {
+        return &[0]Result{};
+    }
+
     var c_results = try a.alloc(rs.Result, limit);
     const storage = try a.alloc(u8, limit * MAX_TITLE_SIZE);
 
