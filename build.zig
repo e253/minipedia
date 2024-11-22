@@ -46,7 +46,18 @@ pub fn build(b: *std.Build) void {
     if (optimize != .Debug) {
         build_minisearch.addArg("--release");
     }
-    b.getInstallStep().dependOn(&build_minisearch.step);
+
+    const frontend_files = b.addWriteFiles();
+    _ = frontend_files.addCopyDirectory(b.path("frontend/build"), "frontend-files", .{});
+    const frontend_bundler = b.addExecutable(.{
+        .name = "bundle_frontend",
+        .root_source_file = b.path("tools/bundle_frontend.zig"),
+        .target = b.host,
+    });
+    const bundle_frontend_step = b.addRunArtifact(frontend_bundler);
+    // TODO: add whole directory as input
+    bundle_frontend_step.addFileInput(b.path("frontend/build/index.html"));
+    const frontend_map = frontend_files.addCopyFile(bundle_frontend_step.addOutputFileArg("frontend.zig"), "frontend.zig");
 
     const exe = b.addExecutable(.{
         .name = "main",
@@ -80,9 +91,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     browser.root_module.addImport("httpz", httpz.module("httpz"));
+    browser.root_module.addAnonymousImport("frontend", .{ .root_source_file = frontend_map });
     browser.linkLibC();
     browser.linkLibrary(lzma);
-    linkMinisearch(b, browser, optimize);
+    linkMinisearch(b, browser, &build_minisearch.step, optimize);
+    const browser_install = b.addInstallArtifact(browser, .{});
+    browser_install.step.dependOn(&frontend_files.step);
+    frontend_files.step.dependOn(&bundle_frontend_step.step);
     b.installArtifact(browser);
 
     const wikiparserxml_tests = b.addTest(.{
@@ -125,7 +140,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    linkMinisearch(b, minisearch_tests, optimize);
+    linkMinisearch(b, minisearch_tests, &build_minisearch.step, optimize);
     minisearch_tests.linkLibC();
     const run_minisearch_tests = b.addRunArtifact(minisearch_tests);
 
@@ -140,7 +155,32 @@ pub fn build(b: *std.Build) void {
     test_mwp_step.dependOn(&run_mwp_tests.step);
 }
 
-pub fn linkMinisearch(b: *std.Build, step: *std.Build.Step.Compile, opt: std.builtin.OptimizeMode) void {
+/// TODO: figure out how this even works
+///
+///
+fn bundleFrontend(b: *std.Build) std.Build.LazyPath {
+    // Copy frontend files to cached tmp dir
+    const frontend_files = b.addWriteFiles();
+    _ = frontend_files.addCopyDirectory(b.path("frontend/build"), "frontend-files", .{});
+
+    // Run bundle_frontend.zig to generate the frontend based on ./frontend/build
+    const frontend_bundler = b.addExecutable(.{
+        .name = "bundle_frontend",
+        .root_source_file = b.path("tools/bundle_frontend.zig"),
+        .target = b.host,
+    });
+
+    // This step immediately runs and generates frontend.zig, which looks for frontend files under path ./frontend-files ^
+    const bundle_frontend_step = b.addRunArtifact(frontend_bundler);
+    const generated_frontend_map_path = bundle_frontend_step.addOutputFileArg("frontend.zig");
+
+    // Copy generated file in tmpdir
+    return frontend_files.addCopyFile(generated_frontend_map_path, "frontend.zig");
+
+    // All happens before other exes start to build
+}
+
+pub fn linkMinisearch(b: *std.Build, step: *std.Build.Step.Compile, build_minisearch_step: *std.Build.Step, opt: std.builtin.OptimizeMode) void {
     step.addIncludePath(b.path("./search"));
     if (opt == .Debug) {
         step.addLibraryPath(b.path("./search/target/debug"));
@@ -149,6 +189,7 @@ pub fn linkMinisearch(b: *std.Build, step: *std.Build.Step.Compile, opt: std.bui
     }
     step.linkSystemLibrary("minisearch");
     step.linkSystemLibrary("unwind");
+    step.step.dependOn(build_minisearch_step);
 }
 
 fn have_x86_feat(t: std.Target, feat: std.Target.x86.Feature) bool {

@@ -3,6 +3,7 @@ const httpz = @import("httpz");
 const stdout = std.io.getStdOut();
 const MinidumpReader = @import("minidump_reader.zig");
 const Minisearch = @import("minisearch.zig");
+const frontend = @import("frontend"); // generated
 
 const c_allocator = std.heap.c_allocator;
 
@@ -69,10 +70,29 @@ fn shutdown(_: c_int) callconv(.C) void {
     }
 }
 
-fn spa(_: State, _: *httpz.Request, res: *httpz.Response) !void {
-    const SPA = @embedFile("index.html");
-    res.content_type = .HTML;
-    res.body = SPA;
+fn spa(_: State, req: *httpz.Request, res: *httpz.Response) !void {
+    if (frontend.files.get(req.url.path)) |contents| {
+        res.content_type = contentTypeFromPath(req.url.path);
+        res.body = contents;
+    } else {
+        res.content_type = .HTML;
+        res.body = frontend.files.get("/fallback.html").?;
+    }
+}
+
+fn contentTypeFromPath(path: []const u8) httpz.ContentType {
+    const ext_type_pairs = [_]struct { []const u8, httpz.ContentType }{
+        .{ ".js", .JS },
+        .{ ".html", .JS },
+    };
+
+    inline for (ext_type_pairs) |pair| {
+        if (path.len > pair[0].len and std.mem.eql(u8, path[path.len - pair[0].len ..], pair[0])) {
+            return pair[1];
+        }
+    }
+
+    return .UNKNOWN;
 }
 
 fn serveArticle(s: State, req: *httpz.Request, res: *httpz.Response) !void {
