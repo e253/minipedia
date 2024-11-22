@@ -42,6 +42,12 @@ pub fn build(b: *std.Build) void {
         else => @panic("Only X86/Arm supported for stringzilla"),
     }
 
+    const build_minisearch = b.addSystemCommand(&.{ "cargo", "build", "--manifest-path", "./search/Cargo.toml" });
+    if (optimize != .Debug) {
+        build_minisearch.addArg("--release");
+    }
+    b.getInstallStep().dependOn(&build_minisearch.step);
+
     const exe = b.addExecutable(.{
         .name = "main",
         .root_source_file = b.path("src/main.zig"),
@@ -76,16 +82,8 @@ pub fn build(b: *std.Build) void {
     browser.root_module.addImport("httpz", httpz.module("httpz"));
     browser.linkLibC();
     browser.linkLibrary(lzma);
-    browser.linkLibrary(stringzilla);
+    linkMinisearch(b, browser, optimize);
     b.installArtifact(browser);
-
-    const create_search = b.addExecutable(.{
-        .name = "create_search",
-        .root_source_file = b.path("src/create_search.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    b.installArtifact(create_search);
 
     const wikiparserxml_tests = b.addTest(.{
         .root_source_file = b.path("src/wikixmlparser.zig"),
@@ -122,14 +120,35 @@ pub fn build(b: *std.Build) void {
     });
     const run_mwp_tests = b.addRunArtifact(mwp_tests);
 
+    const minisearch_tests = b.addTest(.{
+        .root_source_file = b.path("src/minisearch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    linkMinisearch(b, minisearch_tests, optimize);
+    minisearch_tests.linkLibC();
+    const run_minisearch_tests = b.addRunArtifact(minisearch_tests);
+
     const test_step = b.step("test", "Run All Unit Tests");
     test_step.dependOn(&run_wikiparserxml_tests.step);
     test_step.dependOn(&run_slice_array_tests.step);
     test_step.dependOn(&run_lzma_binding_tests.step);
     test_step.dependOn(&run_mwp_tests.step);
+    test_step.dependOn(&run_minisearch_tests.step);
 
     const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
     test_mwp_step.dependOn(&run_mwp_tests.step);
+}
+
+pub fn linkMinisearch(b: *std.Build, step: *std.Build.Step.Compile, opt: std.builtin.OptimizeMode) void {
+    step.addIncludePath(b.path("./search"));
+    if (opt == .Debug) {
+        step.addLibraryPath(b.path("./search/target/debug"));
+    } else {
+        step.addLibraryPath(b.path("./search/target/release"));
+    }
+    step.linkSystemLibrary("minisearch");
+    step.linkSystemLibrary("unwind");
 }
 
 fn have_x86_feat(t: std.Target, feat: std.Target.x86.Feature) bool {

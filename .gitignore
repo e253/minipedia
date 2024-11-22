@@ -6,4 +6,4 @@ out.minidump
 logs.db
 logs.db.wal
 titles.txt
-out.index
+search_index
