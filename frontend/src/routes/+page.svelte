@@ -81,7 +81,10 @@
         <hr class="neutral-200" />
 
         {#each results as result}
-            <a href="/wiki/{result.id}" data-sveltekit-preload-data="false">
+            <a
+                href="/wiki/{result.title.replaceAll(' ', '_')}"
+                data-sveltekit-preload-data="false"
+            >
                 <div
                     class="grid grid-cols-8 auto-rows-auto p-1 h-10 rounded-lg hover:bg-neutral-200"
                 >

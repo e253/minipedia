@@ -149,11 +149,12 @@ pub extern "C" fn ms_doc_id_from_title(
         Box::new(PhraseQuery::new(terms)) as Box<dyn Query>
     };
 
+    // This query makes the assumption that an exact match for a phrase query will always be the first result
     let results = searcher
-        .search(&query, &TopDocs::with_limit(2))
+        .search(&query, &TopDocs::with_limit(1))
         .expect("Query for doc id by title");
 
-    if results.len() != 1 {
+    if results.len() == 0 {
         return NOT_FOUND;
     }
 

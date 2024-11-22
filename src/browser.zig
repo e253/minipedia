@@ -37,7 +37,7 @@ pub fn main() !void {
     server.dispatcher(dispatcher);
     var router = server.router();
 
-    router.get("/api/article/:id", serveArticle);
+    router.get("/api/article", serveArticle);
     router.get("/api/search", search);
     router.get("/*", spa);
 
@@ -76,26 +76,52 @@ fn spa(_: State, _: *httpz.Request, res: *httpz.Response) !void {
 }
 
 fn serveArticle(s: State, req: *httpz.Request, res: *httpz.Response) !void {
-    const id_str_opt = req.param("id");
-    if (id_str_opt == null) {
-        res.status = 400;
-        res.body =
-            \\<h1> No article id provided </h1>
-        ;
-        return;
-    }
-    const id = std.fmt.parseInt(u64, id_str_opt.?, 10) catch |err| {
-        res.status = 400;
-        try std.fmt.format(res.writer(), "<h1>Could not parse '{s}' to u64. error.{s}</h1>", .{ id_str_opt.?, @errorName(err) });
-        return;
-    };
+    const query = try req.query();
 
-    if (try s.reader.markdown(id)) |markdown| {
+    if (query.get("title")) |title| {
+        if (title.len == 0) {
+            res.status = 400;
+            res.body = "Invalid 'title': empty title.";
+        } else if (std.mem.indexOfAny(u8, title, &std.ascii.whitespace) != null) {
+            res.status = 400;
+            res.body = "Invalid 'title': contains whitespace.";
+        } else if (title.len > Minisearch.MAX_TITLE_SIZE) {
+            res.status = 400;
+            try std.fmt.format(res.writer(), "Invalid 'title': Exceeds the max size, {}", .{Minisearch.MAX_TITLE_SIZE});
+        } else {
+            // Wikititle url encoding replaces spaces with underscores.
+            // We want the canonical version for searching.
+            var scratch: [Minisearch.MAX_TITLE_SIZE]u8 = undefined;
+            @memcpy(scratch[0..title.len], title);
+            const normalized_title = scratch[0..title.len];
+            std.mem.replaceScalar(u8, normalized_title, '_', ' ');
+
+            if (s.search.doc(normalized_title)) |doc_id| {
+                try serveArticleByID(s.reader, doc_id, res);
+            } else {
+                res.status = 404;
+                try std.fmt.format(res.writer(), "No article for title '{s}' in the index.", .{normalized_title});
+            }
+        }
+    } else if (query.get("id")) |id_str| {
+        _ = id_str;
+        // TODO
+        res.status = 400;
+        res.body = "'id' query param not supported yet";
+    } else {
+        res.status = 400;
+        res.content_type = .TEXT;
+        res.body = "Invalid request: no 'title' or 'id' query parameters provided";
+    }
+}
+
+fn serveArticleByID(reader: MinidumpReader, id: usize, res: *httpz.Response) !void {
+    if (try reader.markdown(id)) |markdown| {
         res.status = 200;
         res.body = markdown;
     } else {
         res.status = 404;
-        try std.fmt.format(res.writer(), "<h1> No article for id {} </h1>", .{id});
+        try std.fmt.format(res.writer(), "No article for id {}", .{id});
     }
 }
 

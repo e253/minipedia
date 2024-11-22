@@ -9,16 +9,16 @@ import wikiLinkPlugin from 'remark-wiki-link';
 import { unified } from "unified";
 
 export const load: PageLoad = async ({ params }) => {
-    const resp = await fetch(`/api/article/${params.slug}`)
+    const resp = await fetch(`/api/article?title=${params.slug}`)
     if (!resp.ok) {
-        error(resp.status, 'Error encountered fetching article data.');
+        error(resp.status, await resp.text());
     }
 
     const markdown = await resp.text();
 
     const articleHtml = await unified()
         .use(remarkParse)
-        .use(wikiLinkPlugin, { aliasDivider: "|", hrefTemplate: (permalink: string) => `/wiki/${permalink}` })
+        .use(wikiLinkPlugin, { aliasDivider: "|", hrefTemplate: (permalink: string) => `/wiki/${permalink.replaceAll(" ", "_")}` })
         .use(remarkRehype)
         .use(rehypeSanitize)
         .use(rehypeStringify)

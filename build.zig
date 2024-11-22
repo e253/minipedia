@@ -42,6 +42,12 @@ pub fn build(b: *std.Build) void {
         else => @panic("Only X86/Arm supported for stringzilla"),
     }
 
+    const build_minisearch = b.addSystemCommand(&.{ "cargo", "build", "--manifest-path", "./search/Cargo.toml" });
+    if (optimize != .Debug) {
+        build_minisearch.addArg("--release");
+    }
+    b.getInstallStep().dependOn(&build_minisearch.step);
+
     const exe = b.addExecutable(.{
         .name = "main",
         .root_source_file = b.path("src/main.zig"),
