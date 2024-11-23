@@ -7,3 +7,4 @@ logs.db
 logs.db.wal
 titles.txt
 search_index
+.intentionally-empty-file.o

@@ -2,201 +2,216 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const MinisearchTarget = enum {
+        Amd64Linux,
+        Amd64Windows, // lzma broken
+        Arm64Macos, // lzma broken
+    };
+    const target_option = b.option(MinisearchTarget, "target", "Select a supported build target");
+    const target, const rust_target: []const u8 = blk: {
+        if (target_option) |requested_target| {
+            switch (requested_target) {
+                .Amd64Linux => break :blk .{
+                    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
+                    "x86_64-unknown-linux-musl",
+                },
+                .Amd64Windows => break :blk .{
+                    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+                    "x86_64-pc-windows-gnu",
+                },
+                .Arm64Macos => break :blk .{
+                    b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
+                    "aarch64-apple-darwin",
+                },
+            }
+        } else {
+            const default = b.host.result;
+            switch (default.os.tag) {
+                .linux => {
+                    if (default.cpu.arch == .x86_64) {
+                        break :blk .{
+                            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
+                            "x86_64-unknown-linux-musl",
+                        };
+                    }
+                },
+                .windows => {
+                    if (default.cpu.arch == .x86_64) {
+                        break :blk .{
+                            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+                            "x86_64-pc-windows-gnu",
+                        };
+                    }
+                },
+                .macos => {
+                    if (default.cpu.arch == .aarch64) {
+                        break :blk .{
+                            b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
+                            "aarch64-apple-darwin",
+                        };
+                    }
+                },
+                else => {},
+            }
+            std.io.getStdErr().writeAll(
+                \\No target provided and none could be selected automatically from default options.
+                \\Please select a target.
+                \\
+                \\  zig build -Dtarget=Amd64Linux
+                \\
+                \\  Options: Amd64Linux, Amd64Windows, Arm64Macos
+                \\
+                \\
+            ) catch unreachable;
+            return;
+        }
+    };
+
     const optimize = b.standardOptimizeOption(.{});
 
+    // Dependencies.
     const rxml = b.dependency("rapidxml", .{});
     const lzma = buildLibLzma(b, target);
     const httpz = b.dependency("httpz", .{ .target = target, .optimize = optimize });
+    const build_minisearch = b.addSystemCommand(&.{ "cargo", "zigbuild", "--manifest-path", "./search/Cargo.toml", "--target" });
+    build_minisearch.addArg(rust_target);
+    if (optimize != .Debug) build_minisearch.addArg("--release");
 
-    const stringzilla = b.addStaticLibrary(.{
-        .name = "stringzilla",
-        .root_source_file = b.path("src/stringzilla.zig"),
-        .target = b.resolveTargetQuery(.{
-            .cpu_model = .{
-                .explicit = &.{
-                    .name = "ivybridge+evex512",
-                    .llvm_name = "ivybridge+evex512",
-                    .features = std.Target.Cpu.Feature.Set.empty,
-                },
-            },
-        }),
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    stringzilla.addIncludePath(b.path("src"));
-    switch (target.result.cpu.arch) {
-        .x86, .x86_64 => stringzilla.addCSourceFile(.{ .file = b.path("src/stringzilla.c"), .flags = &.{
-            "-DSZ_AVOID_LIBC=1",
-            "-DSZ_USE_X86_AVX2=1",
-            "-DSZ_USE_X86_AVX512=1",
-            "-DSZ_USE_X86_NEON=0",
-            "-DSZ_USE_X86_SVE=0",
-        } }),
-        .arm, .aarch64 => stringzilla.addCSourceFile(.{ .file = b.path("src/stringzilla.c"), .flags = &.{
-            "-DSZ_USE_X86_AVX2=0",
-            "-DSZ_USE_X86_AVX512=0",
-            "-DSZ_USE_X86_NEON=1",
-            "-DSZ_USE_X86_SVE=1",
-        } }),
-        else => @panic("Only X86/Arm supported for stringzilla"),
+    // Archiver and Article Dumper.
+    {
+        const exe = b.addExecutable(.{
+            .name = "main",
+            .root_source_file = b.path("src/main.zig"),
+            .target = b.host,
+            .optimize = optimize,
+        });
+        const install_exe = b.addInstallArtifact(exe, .{});
+        exe.addCSourceFiles(.{ .root = b.path("src"), .files = &.{ "wikixmlparser.cpp", "duck_tracer.c" }, .flags = &.{"-DWXMLP_LOG"} });
+        exe.addIncludePath(rxml.path(""));
+        exe.addIncludePath(b.path("src"));
+        exe.linkLibC();
+        exe.linkLibCpp();
+        exe.linkLibrary(buildLibLzma(b, b.host));
+        exe.linkSystemLibrary("duckdb");
+
+        const archive_build_step = b.step("archiver", "build minidump archiving tool");
+        archive_build_step.dependOn(&install_exe.step);
     }
 
-    const build_minisearch = b.addSystemCommand(&.{ "cargo", "build", "--manifest-path", "./search/Cargo.toml" });
-    if (optimize != .Debug) {
-        build_minisearch.addArg("--release");
+    // Utility for dumping articles from a minidump file.
+    {
+        const get_article = b.addExecutable(.{
+            .name = "get_article",
+            .root_source_file = b.path("src/get_article.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        get_article.linkLibC();
+        get_article.linkLibrary(lzma);
+        b.installArtifact(get_article);
     }
 
-    const frontend_files = b.addWriteFiles();
-    _ = frontend_files.addCopyDirectory(b.path("frontend/build"), "frontend-files", .{});
-    const frontend_bundler = b.addExecutable(.{
-        .name = "bundle_frontend",
-        .root_source_file = b.path("tools/bundle_frontend.zig"),
-        .target = b.host,
-    });
-    const bundle_frontend_step = b.addRunArtifact(frontend_bundler);
-    // TODO: add whole directory as input
-    bundle_frontend_step.addFileInput(b.path("frontend/build/index.html"));
-    const frontend_map = frontend_files.addCopyFile(bundle_frontend_step.addOutputFileArg("frontend.zig"), "frontend.zig");
+    // Browser.
+    {
+        // Frontend.
+        const frontend_bundler = b.addExecutable(.{
+            .name = "bundle_frontend",
+            .root_source_file = b.path("tools/bundle_frontend.zig"),
+            .target = b.host,
+        });
+        const bundle_frontend_step = b.addRunArtifact(frontend_bundler);
+        bundle_frontend_step.addFileInput(b.path("frontend/build/index.html")); // TODO: add all other files in dir as inputs
+        const frontend_zig = bundle_frontend_step.addOutputFileArg("frontend.zig");
 
-    const exe = b.addExecutable(.{
-        .name = "main",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.addCSourceFiles(.{ .root = b.path("src"), .files = &.{ "wikixmlparser.cpp", "duck_tracer.c" }, .flags = &.{"-DWXMLP_LOG"} });
-    exe.addIncludePath(rxml.path(""));
-    exe.addIncludePath(b.path("src"));
-    exe.linkLibC();
-    exe.linkLibCpp();
-    exe.linkLibrary(lzma);
-    exe.linkSystemLibrary("duckdb");
-    b.installArtifact(exe);
+        const frontend_files = b.addWriteFiles();
+        _ = frontend_files.addCopyDirectory(b.path("frontend/build"), "frontend-files", .{});
+        const copied_frontend_zig = frontend_files.addCopyFile(frontend_zig, "frontend.zig");
 
-    const get_article = b.addExecutable(.{
-        .name = "get_article",
-        .root_source_file = b.path("src/get_article.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    get_article.linkLibC();
-    get_article.linkLibrary(lzma);
-    b.installArtifact(get_article);
+        // Browser executable.
+        const browser = b.addExecutable(.{
+            .name = "browser",
+            .root_source_file = b.path("src/browser.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        browser.root_module.addImport("httpz", httpz.module("httpz"));
+        browser.root_module.addAnonymousImport("frontend", .{ .root_source_file = copied_frontend_zig });
+        browser.linkLibC();
+        browser.linkLibrary(lzma);
+        linkMinisearch(b, browser, &build_minisearch.step, optimize);
 
-    const browser = b.addExecutable(.{
-        .name = "browser",
-        .root_source_file = b.path("src/browser.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    browser.root_module.addImport("httpz", httpz.module("httpz"));
-    browser.root_module.addAnonymousImport("frontend", .{ .root_source_file = frontend_map });
-    browser.linkLibC();
-    browser.linkLibrary(lzma);
-    linkMinisearch(b, browser, &build_minisearch.step, optimize);
-    const browser_install = b.addInstallArtifact(browser, .{});
-    browser_install.step.dependOn(&frontend_files.step);
-    frontend_files.step.dependOn(&bundle_frontend_step.step);
-    b.installArtifact(browser);
+        const browser_install = b.addInstallArtifact(browser, .{});
+        b.getInstallStep().dependOn(&browser_install.step);
+        browser_install.step.dependOn(&bundle_frontend_step.step);
+    }
 
-    const wikiparserxml_tests = b.addTest(.{
-        .root_source_file = b.path("src/wikixmlparser.zig"),
-        .target = target,
-        .optimize = .Debug,
-    });
-    wikiparserxml_tests.addCSourceFile(.{ .file = b.path("src/wikixmlparser.cpp") });
-    wikiparserxml_tests.addIncludePath(rxml.path(""));
-    wikiparserxml_tests.addIncludePath(b.path("src"));
-    wikiparserxml_tests.linkLibC();
-    wikiparserxml_tests.linkLibCpp();
-    const run_wikiparserxml_tests = b.addRunArtifact(wikiparserxml_tests);
+    // Tests.
+    {
+        const wikiparserxml_tests = b.addTest(.{
+            .root_source_file = b.path("src/wikixmlparser.zig"),
+            .target = target,
+            .optimize = .Debug,
+        });
+        wikiparserxml_tests.addCSourceFile(.{ .file = b.path("src/wikixmlparser.cpp") });
+        wikiparserxml_tests.addIncludePath(rxml.path(""));
+        wikiparserxml_tests.addIncludePath(b.path("src"));
+        wikiparserxml_tests.linkLibC();
+        wikiparserxml_tests.linkLibCpp();
+        const run_wikiparserxml_tests = b.addRunArtifact(wikiparserxml_tests);
 
-    const slice_array_tests = b.addTest(.{
-        .root_source_file = b.path("src/slice_array.zig"),
-        .target = target,
-        .optimize = .Debug,
-    });
-    const run_slice_array_tests = b.addRunArtifact(slice_array_tests);
+        const slice_array_tests = b.addTest(.{
+            .root_source_file = b.path("src/slice_array.zig"),
+            .target = target,
+            .optimize = .Debug,
+        });
+        const run_slice_array_tests = b.addRunArtifact(slice_array_tests);
 
-    const lzma_binding_tests = b.addTest(.{
-        .root_source_file = b.path("src/lzma.zig"),
-        .target = target,
-        .optimize = .Debug,
-    });
-    lzma_binding_tests.linkLibC();
-    lzma_binding_tests.linkLibrary(lzma);
-    const run_lzma_binding_tests = b.addRunArtifact(lzma_binding_tests);
+        const lzma_binding_tests = b.addTest(.{
+            .root_source_file = b.path("src/lzma.zig"),
+            .target = target,
+            .optimize = .Debug,
+        });
+        lzma_binding_tests.linkLibC();
+        lzma_binding_tests.linkLibrary(lzma);
+        const run_lzma_binding_tests = b.addRunArtifact(lzma_binding_tests);
 
-    const mwp_tests = b.addTest(.{
-        .root_source_file = b.path("src/MediaWikiParser.zig"),
-        .target = target,
-        .optimize = .Debug,
-    });
-    const run_mwp_tests = b.addRunArtifact(mwp_tests);
+        const mwp_tests = b.addTest(.{
+            .root_source_file = b.path("src/MediaWikiParser.zig"),
+            .target = target,
+            .optimize = .Debug,
+        });
+        const run_mwp_tests = b.addRunArtifact(mwp_tests);
 
-    const minisearch_tests = b.addTest(.{
-        .root_source_file = b.path("src/minisearch.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    linkMinisearch(b, minisearch_tests, &build_minisearch.step, optimize);
-    minisearch_tests.linkLibC();
-    const run_minisearch_tests = b.addRunArtifact(minisearch_tests);
+        const minisearch_tests = b.addTest(.{
+            .root_source_file = b.path("src/minisearch.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        linkMinisearch(b, minisearch_tests, &build_minisearch.step, optimize);
+        minisearch_tests.linkLibC();
+        const run_minisearch_tests = b.addRunArtifact(minisearch_tests);
 
-    const test_step = b.step("test", "Run All Unit Tests");
-    test_step.dependOn(&run_wikiparserxml_tests.step);
-    test_step.dependOn(&run_slice_array_tests.step);
-    test_step.dependOn(&run_lzma_binding_tests.step);
-    test_step.dependOn(&run_mwp_tests.step);
-    test_step.dependOn(&run_minisearch_tests.step);
+        const test_step = b.step("test", "Run All Unit Tests");
+        test_step.dependOn(&run_wikiparserxml_tests.step);
+        test_step.dependOn(&run_slice_array_tests.step);
+        test_step.dependOn(&run_lzma_binding_tests.step);
+        test_step.dependOn(&run_mwp_tests.step);
+        test_step.dependOn(&run_minisearch_tests.step);
 
-    const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
-    test_mwp_step.dependOn(&run_mwp_tests.step);
+        const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
+        test_mwp_step.dependOn(&run_mwp_tests.step);
+    }
 }
 
-/// TODO: figure out how this even works
-///
-///
-fn bundleFrontend(b: *std.Build) std.Build.LazyPath {
-    // Copy frontend files to cached tmp dir
-    const frontend_files = b.addWriteFiles();
-    _ = frontend_files.addCopyDirectory(b.path("frontend/build"), "frontend-files", .{});
-
-    // Run bundle_frontend.zig to generate the frontend based on ./frontend/build
-    const frontend_bundler = b.addExecutable(.{
-        .name = "bundle_frontend",
-        .root_source_file = b.path("tools/bundle_frontend.zig"),
-        .target = b.host,
-    });
-
-    // This step immediately runs and generates frontend.zig, which looks for frontend files under path ./frontend-files ^
-    const bundle_frontend_step = b.addRunArtifact(frontend_bundler);
-    const generated_frontend_map_path = bundle_frontend_step.addOutputFileArg("frontend.zig");
-
-    // Copy generated file in tmpdir
-    return frontend_files.addCopyFile(generated_frontend_map_path, "frontend.zig");
-
-    // All happens before other exes start to build
-}
-
-pub fn linkMinisearch(b: *std.Build, step: *std.Build.Step.Compile, build_minisearch_step: *std.Build.Step, opt: std.builtin.OptimizeMode) void {
-    step.addIncludePath(b.path("./search"));
+pub fn linkMinisearch(b: *std.Build, artifact: *std.Build.Step.Compile, build_minisearch_step: *std.Build.Step, opt: std.builtin.OptimizeMode) void {
     if (opt == .Debug) {
-        step.addLibraryPath(b.path("./search/target/debug"));
+        artifact.addLibraryPath(b.path("./search/target/x86_64-unknown-linux-musl/debug"));
     } else {
-        step.addLibraryPath(b.path("./search/target/release"));
+        artifact.addLibraryPath(b.path("./search/target/x86_64-unknown-linux-musl/release"));
     }
-    step.linkSystemLibrary("minisearch");
-    step.linkSystemLibrary("unwind");
-    step.step.dependOn(build_minisearch_step);
-}
-
-fn have_x86_feat(t: std.Target, feat: std.Target.x86.Feature) bool {
-    return switch (t.cpu.arch) {
-        .x86, .x86_64 => std.Target.x86.featureSetHas(t.cpu.features, feat),
-        else => false,
-    };
+    artifact.linkSystemLibrary("minisearch");
+    artifact.linkSystemLibrary("unwind");
+    artifact.step.dependOn(build_minisearch_step);
 }
 
 pub fn buildLibLzma(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compile {
