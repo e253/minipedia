@@ -16,9 +16,19 @@ export const load: PageLoad = async ({ params }) => {
 
     const markdown = await resp.text();
 
+    const hrefTemplate = (permalink: string) => {
+        console.log("link running on '", permalink, "'")
+        return `/wiki/${permalink.replaceAll(/ /g, "_")}`
+    };
+
+    const pageResolver = (name: string) => {
+        console.log("page resolving '", name, "'");
+        return [name]
+    };
+
     const articleHtml = await unified()
-        .use(remarkParse)
-        .use(wikiLinkPlugin, { aliasDivider: "|", hrefTemplate: (permalink: string) => `/wiki/${permalink.replaceAll(" ", "_")}` })
+        .use(remarkParse, { gfm: true })
+        .use(wikiLinkPlugin, { aliasDivider: "|", hrefTemplate, pageResolver }) // syntax is not faithful MW standard
         .use(remarkRehype)
         .use(rehypeSanitize)
         .use(rehypeStringify)

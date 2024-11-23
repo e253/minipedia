@@ -1,0 +1,41 @@
+.article-root {
+    /*font-family: "Linux Libertine", "Georgia", "Times", "Source Serif Pro", serif;
+    line-height: 1.375;*/
+}
+
+.article-root h1 {
+    font-size: 1.875rem;
+    line-height: 2.25rem;
+}
+
+.article-root h2,
+h3 {
+    font-size: 1.5rem;
+    line-height: 2rem;
+}
+
+.article-root h1,
+h2,
+h3 {
+    margin-top: 2rem;
+    margin-bottom: .5rem;
+    font-weight: normal;
+    border-bottom: 1px solid rgb(107, 114, 128);
+}
+
+.article-root p {
+    /* mt-6 */
+    margin-bottom: 1.5rem;
+    /* mb-6 */
+    margin-bottom: 1.5rem;
+
+    direction: ltr;
+}
+
+.article-root a {
+    color: rgb(16, 185, 129);
+}
+
+.article-root a:hover {
+    text-decoration: underline;
+}

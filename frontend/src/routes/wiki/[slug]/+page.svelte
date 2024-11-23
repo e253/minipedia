@@ -4,16 +4,21 @@
     let { data }: { data: PageData } = $props();
 </script>
 
-<div class="w-full flex justify-center">
-    <div class="max-w-prose">
-        <div id="article-html-container">
-            {@html data.articleHtml}
-        </div>
+<svelte:head>
+    <link rel="stylesheet" href="/article.css" />
+</svelte:head>
+
+<div class="flex justify-center w-full">
+    <div
+        class="max-w-prose-xl article-root"
+        data-sveltekit-preload-data="false"
+    >
+        {@html data.articleHtml}
     </div>
 </div>
 
 <style>
-    #article-html-container {
-        all: revert;
+    .max-w-prose-xl {
+        max-width: 80ch;
     }
 </style>
