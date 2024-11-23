@@ -1,4 +1,8 @@
-const c = @cImport(@cInclude("lzma.h"));
+const c = @cImport({
+    @cDefine("LZMA_API(type)", "type");
+    @cInclude("lzma.h");
+});
+
 const std = @import("std");
 
 // Allocator

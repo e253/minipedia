@@ -1,6 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const httpz = @import("httpz");
-const stdout = std.io.getStdOut();
 const MinidumpReader = @import("minidump_reader.zig");
 const Minisearch = @import("minisearch.zig");
 const frontend = @import("frontend"); // generated
@@ -33,7 +33,7 @@ pub fn main() !void {
     var server = try httpz.ServerApp(State).init(c_allocator, .{ .address = ADDRESS, .port = PORT }, state);
     defer server.deinit();
     server_instance = &server;
-    try std.fmt.format(stdout.writer(), "http://{s}:{}/\n\n", .{ ADDRESS, PORT });
+    try std.fmt.format(std.io.getStdOut().writer(), "http://{s}:{}/\n\n", .{ ADDRESS, PORT });
 
     server.dispatcher(dispatcher);
     var router = server.router();
@@ -46,16 +46,20 @@ pub fn main() !void {
 }
 
 fn registerCleanShutdown() !void {
-    try std.posix.sigaction(std.posix.SIG.INT, &.{
-        .handler = .{ .handler = shutdown },
-        .mask = std.posix.empty_sigset,
-        .flags = 0,
-    }, null);
-    try std.posix.sigaction(std.posix.SIG.TERM, &.{
-        .handler = .{ .handler = shutdown },
-        .mask = std.posix.empty_sigset,
-        .flags = 0,
-    }, null);
+    if (builtin.target.os.tag != .windows) {
+        try std.posix.sigaction(std.posix.SIG.INT, &.{
+            .handler = .{ .handler = shutdown },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        }, null);
+        try std.posix.sigaction(std.posix.SIG.TERM, &.{
+            .handler = .{ .handler = shutdown },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        }, null);
+    } else {
+        try std.os.windows.SetConsoleCtrlHandler(&win_shutdown, true);
+    }
 }
 
 var shutdown_lock = std.Thread.Mutex{};
@@ -68,6 +72,19 @@ fn shutdown(_: c_int) callconv(.C) void {
             std.io.getStdIn().writeAll("\rBye!\n") catch {};
         }
     }
+}
+
+fn win_shutdown(_: std.os.windows.DWORD) callconv(std.os.windows.WINAPI) std.os.windows.BOOL {
+    if (shutdown_lock.tryLock()) {
+        defer shutdown_lock.unlock();
+        if (server_instance) |server| {
+            server.stop();
+            server_instance = null;
+            std.io.getStdIn().writeAll("\rBye!\n") catch {};
+            return std.os.windows.TRUE;
+        }
+    }
+    return std.os.windows.FALSE;
 }
 
 fn spa(_: State, req: *httpz.Request, res: *httpz.Response) !void {

@@ -4,8 +4,8 @@ const builtin = @import("builtin");
 pub fn build(b: *std.Build) void {
     const MinisearchTarget = enum {
         Amd64Linux,
-        Amd64Windows, // lzma broken
-        Arm64Macos, // lzma broken
+        Amd64Windows,
+        Arm64Macos,
     };
     const target_option = b.option(MinisearchTarget, "target", "Select a supported build target");
     const target, const rust_target: []const u8 = blk: {
@@ -15,10 +15,14 @@ pub fn build(b: *std.Build) void {
                     b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
                     "x86_64-unknown-linux-musl",
                 },
-                .Amd64Windows => break :blk .{
-                    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
-                    "x86_64-pc-windows-gnu",
+                .Amd64Windows => {
+                    std.io.getStdErr().writeAll("Error [Fatal]: Amd64Windows is broken. Compiler-rt bug that's fixed after 0.13.0.\n") catch unreachable;
+                    return;
                 },
+                //break :blk .{
+                //    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+                //    "x86_64-pc-windows-gnu",
+                //},
                 .Arm64Macos => break :blk .{
                     b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
                     "aarch64-apple-darwin",
@@ -138,7 +142,7 @@ pub fn build(b: *std.Build) void {
         browser.root_module.addAnonymousImport("frontend", .{ .root_source_file = copied_frontend_zig });
         browser.linkLibC();
         browser.linkLibrary(lzma);
-        linkMinisearch(b, browser, &build_minisearch.step, optimize);
+        linkMinisearch(b, browser, &build_minisearch.step, rust_target, optimize);
 
         const browser_install = b.addInstallArtifact(browser, .{});
         b.getInstallStep().dependOn(&browser_install.step);
@@ -187,7 +191,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        linkMinisearch(b, minisearch_tests, &build_minisearch.step, optimize);
+        linkMinisearch(b, minisearch_tests, &build_minisearch.step, rust_target, optimize);
         minisearch_tests.linkLibC();
         const run_minisearch_tests = b.addRunArtifact(minisearch_tests);
 
@@ -203,11 +207,11 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-pub fn linkMinisearch(b: *std.Build, artifact: *std.Build.Step.Compile, build_minisearch_step: *std.Build.Step, opt: std.builtin.OptimizeMode) void {
+pub fn linkMinisearch(b: *std.Build, artifact: *std.Build.Step.Compile, build_minisearch_step: *std.Build.Step, rust_target: []const u8, opt: std.builtin.OptimizeMode) void {
     if (opt == .Debug) {
-        artifact.addLibraryPath(b.path("./search/target/x86_64-unknown-linux-musl/debug"));
+        artifact.addLibraryPath(b.path(b.fmt("./search/target/{s}/debug", .{rust_target})));
     } else {
-        artifact.addLibraryPath(b.path("./search/target/x86_64-unknown-linux-musl/release"));
+        artifact.addLibraryPath(b.path(b.fmt("./search/target/{s}/release", .{rust_target})));
     }
     artifact.linkSystemLibrary("minisearch");
     artifact.linkSystemLibrary("unwind");
@@ -219,14 +223,14 @@ pub fn buildLibLzma(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.
 
     const lzma = b.addStaticLibrary(.{
         .name = "lzma",
-        .link_libc = true,
         .target = target,
         .optimize = .ReleaseFast,
     });
+    lzma.linkLibC();
     lzma.addCSourceFiles(.{
         .root = xz_tools.path(""),
         .files = &xz_tools_sources,
-        .flags = &.{"-DHAVE_CONFIG_H"},
+        .flags = &.{ "-DHAVE_CONFIG_H", "-DLZMA_API_STATIC" },
     });
     for (xz_tools_includes) |xz_include| {
         lzma.addIncludePath(xz_tools.path(xz_include));
@@ -253,7 +257,6 @@ pub fn buildLibLzma(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.
             .HAVE_GETOPT_H = 1,
             .HAVE_GETOPT_LONG = 1,
             .HAVE_GETTEXT = 1,
-            .HAVE_IMMINTRIN_H = 1,
             .HAVE_INTTYPES_H = 1,
             .HAVE_LINUX_LANDLOCK = 1,
             .HAVE_MBRTOWC = 1,
@@ -276,11 +279,7 @@ pub fn buildLibLzma(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.
             .HAVE_SYS_TYPES_H = 1,
             .HAVE_UINTPTR_T = 1,
             .HAVE_UNISTD_H = 1,
-            .HAVE_USABLE_CLMUL = 1,
-            .HAVE_VISIBILITY = 0,
             .HAVE__BOOL = 1,
-            .HAVE__MM_MOVEMASK_EPI8 = 1,
-            .NDEBUG = 0,
             .PACKAGE = "xz",
             .PACKAGE_BUGREPORT = "xz@tukaani.org",
             .PACKAGE_NAME = "XZ Utils",
@@ -295,6 +294,14 @@ pub fn buildLibLzma(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.
             .VERSION = "5.6.3",
         },
     );
+    if (target.result.cpu.arch == .x86_64) {
+        config_h.addValues(.{
+            .HAVE_IMMINTRIN_H = 1,
+            .HAVE_USABLE_CLMUL = 1,
+            .HAVE__MM_MOVEMASK_EPI8 = 1,
+        });
+    }
+
     lzma.addConfigHeader(config_h);
     lzma.installHeadersDirectory(xz_tools.path("src/liblzma/api"), "", .{});
     b.installArtifact(lzma);
