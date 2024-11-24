@@ -34,5 +34,5 @@ export const load: PageLoad = async ({ params }) => {
         .use(rehypeStringify)
         .process(markdown);
 
-    return { articleHtml }
+    return { articleHtml, title: params.slug.replace("_", " "), wikipedia_link: `https://en.wikipedia.org/wiki/${params.slug}` }
 };

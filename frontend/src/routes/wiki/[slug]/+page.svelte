@@ -6,14 +6,14 @@
 
 <svelte:head>
     <link rel="stylesheet" href="/article.css" />
+    <title>{data.title} - Minipedia</title>
 </svelte:head>
 
-<div class="flex justify-center w-full">
-    <div
-        class="max-w-prose-xl article-root"
-        data-sveltekit-preload-data="false"
-    >
-        {@html data.articleHtml}
+<div class="flex flex-col justify-center items-center w-screen">
+    <div class="py-4 max-w-prose-xl">
+        <div class="w-full article-root" data-sveltekit-preload-data="false">
+            {@html data.articleHtml}
+        </div>
     </div>
 </div>
 

@@ -112,7 +112,11 @@ fn contentTypeFromPath(path: []const u8) httpz.ContentType {
     return .UNKNOWN;
 }
 
+var serve_mtx = std.Thread.Mutex{}; // TODO: remove by making minidump_reader thread safe
 fn serveArticle(s: State, req: *httpz.Request, res: *httpz.Response) !void {
+    serve_mtx.lock();
+    defer serve_mtx.unlock();
+
     const query = try req.query();
 
     if (query.get("title")) |title| {

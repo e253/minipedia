@@ -1,8 +1,3 @@
-.article-root {
-    /*font-family: "Linux Libertine", "Georgia", "Times", "Source Serif Pro", serif;
-    line-height: 1.375;*/
-}
-
 .article-root h1 {
     font-size: 1.875rem;
     line-height: 2.25rem;
@@ -33,7 +28,7 @@ h3 {
 }
 
 .article-root a {
-    color: rgb(16, 185, 129);
+    color: #36c;
 }
 
 .article-root a:hover {
