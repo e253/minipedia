@@ -166,7 +166,7 @@ pub extern "C" fn ms_doc_id_from_title(
         _ => panic!("Non string field found in pos 1 of field values"),
     };
 
-    if matched_title != title {
+    if matched_title.to_ascii_lowercase() != title.to_ascii_lowercase() {
         return NOT_FOUND;
     }
 

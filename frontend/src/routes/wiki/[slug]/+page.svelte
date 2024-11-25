@@ -2,6 +2,14 @@
     import type { PageData } from "./$types";
 
     let { data }: { data: PageData } = $props();
+
+    if (window.history.replaceState) {
+        window.history.replaceState(
+            undefined,
+            data.title,
+            `/wiki/${data.title}`,
+        );
+    }
 </script>
 
 <svelte:head>

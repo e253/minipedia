@@ -16,6 +16,8 @@ export const load: PageLoad = async ({ params }) => {
 
     const markdown = await resp.text();
 
+    const title = markdown.substring(2, markdown.indexOf("\n", 2)).replaceAll(/ /g, "_");
+
     const hrefTemplate = (permalink: string) => {
         console.log("link running on '", permalink, "'")
         return `/wiki/${permalink.replaceAll(/ /g, "_")}`
@@ -34,5 +36,5 @@ export const load: PageLoad = async ({ params }) => {
         .use(rehypeStringify)
         .process(markdown);
 
-    return { articleHtml, title: params.slug.replace("_", " "), wikipedia_link: `https://en.wikipedia.org/wiki/${params.slug}` }
+    return { articleHtml, title, wikipedia_link: `https://en.wikipedia.org/wiki/${title}` }
 };
