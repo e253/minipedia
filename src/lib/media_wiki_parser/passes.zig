@@ -1,7 +1,7 @@
 const std = @import("std");
-const wmp = @import("MediaWikiParser.zig");
+const wmp = @import("../MediaWikiParser.zig");
 const MWAstNode = wmp.MWAstNode;
-const tracing = @import("tracing.zig");
+const tracing = @import("../tracing.zig");
 
 ///////////////////////////////////////////////////////////////////////
 // Ast Passes.

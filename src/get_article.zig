@@ -1,6 +1,6 @@
 const std = @import("std");
 const a = std.heap.c_allocator;
-const MinidumpReader = @import("minidump_reader.zig");
+const MinidumpReader = @import("lib/minidump_reader.zig");
 
 pub fn main() !void {
     const args = try Args.parse();

@@ -96,22 +96,23 @@ pub fn build(b: *std.Build) void {
     }
     build_minisearch.setCwd(b.path("search"));
 
-    // Archiver and Article Dumper.
+    // Archiver.
     const archiver = b.option(bool, "archiver", "Set this option to build the archiver") orelse false;
     if (archiver) {
         const exe = b.addExecutable(.{
-            .name = "main",
-            .root_source_file = b.path("src/main.zig"),
+            .name = "minipedia-archiver",
+            .root_source_file = b.path("src/archiver.zig"),
             .target = b.host,
             .optimize = optimize,
         });
         exe.addCSourceFiles(.{
-            .root = b.path("src"),
-            .files = &.{ "wikixmlparser.cpp", "duck_tracer.c" },
+            .root = b.path("src/lib"),
+            .files = &.{ "wiki_xml_parser/wikixmlparser.cpp", "tracing/duck_tracer.c" },
             .flags = &.{"-DWXMLP_LOG"},
         });
         exe.addIncludePath(rxml.path(""));
-        exe.addIncludePath(b.path("src"));
+        exe.addIncludePath(b.path("src/lib/wiki_xml_parser/"));
+        exe.addIncludePath(b.path("src/lib/tracing/"));
         exe.linkLibC();
         exe.linkLibCpp();
         exe.linkLibrary(buildLibLzma(b, b.host));
@@ -119,7 +120,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
     }
 
-    // Utility for dumping articles from a minidump file.
+    // Dump article by id.
     {
         const get_article = b.addExecutable(.{
             .name = "get_article",
@@ -169,26 +170,26 @@ pub fn build(b: *std.Build) void {
     // Tests.
     {
         const wikiparserxml_tests = b.addTest(.{
-            .root_source_file = b.path("src/wikixmlparser.zig"),
+            .root_source_file = b.path("src/lib/wiki_xml_parser.zig"),
             .target = target,
             .optimize = .Debug,
         });
-        wikiparserxml_tests.addCSourceFile(.{ .file = b.path("src/wikixmlparser.cpp") });
+        wikiparserxml_tests.addCSourceFile(.{ .file = b.path("src/lib/wiki_xml_parser/wikixmlparser.cpp") });
         wikiparserxml_tests.addIncludePath(rxml.path(""));
-        wikiparserxml_tests.addIncludePath(b.path("src"));
+        wikiparserxml_tests.addIncludePath(b.path("src/lib/wiki_xml_parser/"));
         wikiparserxml_tests.linkLibC();
         wikiparserxml_tests.linkLibCpp();
         const run_wikiparserxml_tests = b.addRunArtifact(wikiparserxml_tests);
 
         const slice_array_tests = b.addTest(.{
-            .root_source_file = b.path("src/slice_array.zig"),
+            .root_source_file = b.path("src/lib/slice_array.zig"),
             .target = target,
             .optimize = .Debug,
         });
         const run_slice_array_tests = b.addRunArtifact(slice_array_tests);
 
         const lzma_binding_tests = b.addTest(.{
-            .root_source_file = b.path("src/lzma.zig"),
+            .root_source_file = b.path("src/lib/lzma.zig"),
             .target = target,
             .optimize = .Debug,
         });
@@ -197,14 +198,14 @@ pub fn build(b: *std.Build) void {
         const run_lzma_binding_tests = b.addRunArtifact(lzma_binding_tests);
 
         const mwp_tests = b.addTest(.{
-            .root_source_file = b.path("src/MediaWikiParser.zig"),
+            .root_source_file = b.path("src/lib/MediaWikiParser.zig"),
             .target = target,
             .optimize = .Debug,
         });
         const run_mwp_tests = b.addRunArtifact(mwp_tests);
 
         const minisearch_tests = b.addTest(.{
-            .root_source_file = b.path("src/minisearch.zig"),
+            .root_source_file = b.path("src/lib/minisearch.zig"),
             .target = target,
             .optimize = optimize,
         });

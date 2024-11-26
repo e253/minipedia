@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const httpz = @import("httpz");
-const MinidumpReader = @import("minidump_reader.zig");
-const Minisearch = @import("minisearch.zig");
+const MinidumpReader = @import("lib/minidump_reader.zig");
+const Minisearch = @import("lib/minisearch.zig");
 const frontend = @import("frontend"); // generated
 
 const c_allocator = std.heap.c_allocator;

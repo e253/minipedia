@@ -1,10 +1,10 @@
 const std = @import("std");
-const wxmlp = @import("wikixmlparser.zig");
-const SliceArray = @import("slice_array.zig").SliceArray;
-const lzma = @import("lzma.zig");
-const mwp = @import("MediaWikiParser.zig");
-const passes = @import("passes.zig");
-const DuckTrace = @import("tracing.zig").DuckTrace;
+const wxmlp = @import("lib/wiki_xml_parser.zig");
+const SliceArray = @import("lib/slice_array.zig").SliceArray;
+const lzma = @import("lib/lzma.zig");
+const mwp = @import("lib/MediaWikiParser.zig");
+const passes = @import("lib/media_wiki_parser/passes.zig");
+const DuckTrace = @import("lib/tracing.zig").DuckTrace;
 
 const c_allocator = std.heap.c_allocator;
 
