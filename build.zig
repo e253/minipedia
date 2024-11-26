@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
         Amd64Linux,
         Amd64Windows,
         Arm64Macos,
+        Amd64Macos,
     };
     const target_option = b.option(MinisearchTarget, "target", "Select a supported build target");
     const target, const rust_target: []const u8 = blk: {
@@ -16,16 +17,20 @@ pub fn build(b: *std.Build) void {
                     "x86_64-unknown-linux-musl",
                 },
                 .Amd64Windows => {
-                    std.io.getStdErr().writeAll("Error [Fatal]: Amd64Windows is broken. Compiler-rt bug that's fixed after 0.13.0.\n") catch unreachable;
-                    return;
+                    //std.io.getStdErr().writeAll("Error [Fatal]: Amd64Windows is broken. Compiler-rt bug that's fixed after 0.13.0.\n") catch unreachable;
+                    //return;
+                    break :blk .{
+                        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+                        "x86_64-pc-windows-gnu",
+                    };
                 },
-                //break :blk .{
-                //    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
-                //    "x86_64-pc-windows-gnu",
-                //},
                 .Arm64Macos => break :blk .{
                     b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
                     "aarch64-apple-darwin",
+                },
+                .Amd64Macos => break :blk .{
+                    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos, .abi = .none }),
+                    "x86_64-apple-darwin",
                 },
             }
         } else {
@@ -40,18 +45,26 @@ pub fn build(b: *std.Build) void {
                     }
                 },
                 .windows => {
-                    if (default.cpu.arch == .x86_64) {
-                        break :blk .{
-                            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
-                            "x86_64-pc-windows-gnu",
-                        };
-                    }
+                    std.io.getStdErr().writeAll("Error [Fatal]: Amd64Windows is broken. Compiler-rt bug that's fixed after 0.13.0.\n") catch unreachable;
+                    return;
+                    //if (default.cpu.arch == .x86_64) {
+                    //    break :blk .{
+                    //        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+                    //        "x86_64-pc-windows-gnu",
+                    //    };
+                    //}
                 },
                 .macos => {
                     if (default.cpu.arch == .aarch64) {
                         break :blk .{
                             b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
                             "aarch64-apple-darwin",
+                        };
+                    }
+                    if (default.cpu.arch == .x86_64) {
+                        break :blk .{
+                            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos, .abi = .none }),
+                            "x86_64-apple-darwin",
                         };
                     }
                 },
@@ -77,29 +90,33 @@ pub fn build(b: *std.Build) void {
     const rxml = b.dependency("rapidxml", .{});
     const lzma = buildLibLzma(b, target);
     const httpz = b.dependency("httpz", .{ .target = target, .optimize = optimize });
-    const build_minisearch = b.addSystemCommand(&.{ "cargo", "zigbuild", "--manifest-path", "./search/Cargo.toml", "--target" });
-    build_minisearch.addArg(rust_target);
-    if (optimize != .Debug) build_minisearch.addArg("--release");
+    const build_minisearch = b.addSystemCommand(&.{ "cargo", "zigbuild", "--target", rust_target });
+    if (optimize != .Debug) {
+        build_minisearch.addArg("--release");
+    }
+    build_minisearch.setCwd(b.path("search"));
 
     // Archiver and Article Dumper.
-    {
+    const archiver = b.option(bool, "archiver", "Set this option to build the archiver") orelse false;
+    if (archiver) {
         const exe = b.addExecutable(.{
             .name = "main",
             .root_source_file = b.path("src/main.zig"),
             .target = b.host,
             .optimize = optimize,
         });
-        const install_exe = b.addInstallArtifact(exe, .{});
-        exe.addCSourceFiles(.{ .root = b.path("src"), .files = &.{ "wikixmlparser.cpp", "duck_tracer.c" }, .flags = &.{"-DWXMLP_LOG"} });
+        exe.addCSourceFiles(.{
+            .root = b.path("src"),
+            .files = &.{ "wikixmlparser.cpp", "duck_tracer.c" },
+            .flags = &.{"-DWXMLP_LOG"},
+        });
         exe.addIncludePath(rxml.path(""));
         exe.addIncludePath(b.path("src"));
         exe.linkLibC();
         exe.linkLibCpp();
         exe.linkLibrary(buildLibLzma(b, b.host));
         exe.linkSystemLibrary("duckdb");
-
-        const archive_build_step = b.step("archiver", "build minidump archiving tool");
-        archive_build_step.dependOn(&install_exe.step);
+        b.installArtifact(exe);
     }
 
     // Utility for dumping articles from a minidump file.
