@@ -21,8 +21,9 @@ pub struct Result {
 
 /// Public functions.
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
-pub extern "C" fn ms_init(s: *mut State, index_dir: *const u8, index_dir_len: usize) -> () {
+pub extern "C" fn ms_init(s: *mut State, index_dir: *const u8, index_dir_len: usize) {
     assert!(!index_dir.is_null());
     assert!(!s.is_null());
 
@@ -43,6 +44,7 @@ pub extern "C" fn ms_init(s: *mut State, index_dir: *const u8, index_dir_len: us
     }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn ms_search(
     s: *const State,
@@ -74,11 +76,11 @@ pub extern "C" fn ms_search(
         .search(&query, &TopDocs::with_limit(limit + offset))
         .expect("Error processing query");
 
-    if results.len() == 0 {
+    if results.is_empty() {
         return 0;
     }
 
-    for (i, (_, doc_address)) in (&results).into_iter().skip(offset).enumerate() {
+    for (i, (_, doc_address)) in results.iter().skip(offset).enumerate() {
         let doc: TantivyDocument = searcher.doc(*doc_address).unwrap();
         let doc_values = doc.field_values();
         assert!(doc_values.len() == 2);
@@ -111,6 +113,7 @@ pub extern "C" fn ms_search(
     results.len()
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn ms_doc_id_from_title(
     state: *const State,
@@ -139,7 +142,7 @@ pub extern "C" fn ms_doc_id_from_title(
         terms.push(tantivy::Term::from_field_text(title_field, &tok.text));
     }
 
-    if terms.len() == 0 {
+    if terms.is_empty() {
         return NOT_FOUND;
     }
 
@@ -154,7 +157,7 @@ pub extern "C" fn ms_doc_id_from_title(
         .search(&query, &TopDocs::with_limit(1))
         .expect("Query for doc id by title");
 
-    if results.len() == 0 {
+    if results.is_empty() {
         return NOT_FOUND;
     }
 
@@ -175,11 +178,12 @@ pub extern "C" fn ms_doc_id_from_title(
         _ => panic!("Non u64 field found in pos 0 of field values"),
     };
 
-    doc_id.clone() as usize
+    *doc_id as usize
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
-pub extern "C" fn ms_deinit(state: *const State) -> () {
+pub extern "C" fn ms_deinit(state: *const State) {
     assert!(!state.is_null());
     unsafe {
         let state = &*state;

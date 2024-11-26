@@ -35,7 +35,7 @@ fn main() -> tantivy::Result<()> {
 
     let index = Index::create_in_dir(&path, schema.clone())?;
 
-    let doc_src = if args.r#in.len() > 0 {
+    let doc_src = if !args.r#in.is_empty() {
         DocumentSource::FromFile(PathBuf::from(&args.r#in))
     } else {
         DocumentSource::FromPipe
