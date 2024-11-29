@@ -2,88 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
-    const MinisearchTarget = enum {
-        Amd64Linux,
-        Amd64Windows,
-        Arm64Macos,
-        Amd64Macos,
-    };
-    const target_option = b.option(MinisearchTarget, "target", "Select a supported build target");
-    const target, const rust_target: []const u8 = blk: {
-        if (target_option) |requested_target| {
-            switch (requested_target) {
-                .Amd64Linux => break :blk .{
-                    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
-                    "x86_64-unknown-linux-musl",
-                },
-                .Amd64Windows => {
-                    //std.io.getStdErr().writeAll("Error [Fatal]: Amd64Windows is broken. Compiler-rt bug that's fixed after 0.13.0.\n") catch unreachable;
-                    //return;
-                    break :blk .{
-                        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
-                        "x86_64-pc-windows-gnu",
-                    };
-                },
-                .Arm64Macos => break :blk .{
-                    b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
-                    "aarch64-apple-darwin",
-                },
-                .Amd64Macos => break :blk .{
-                    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos, .abi = .none }),
-                    "x86_64-apple-darwin",
-                },
-            }
-        } else {
-            const default = b.host.result;
-            switch (default.os.tag) {
-                .linux => {
-                    if (default.cpu.arch == .x86_64) {
-                        break :blk .{
-                            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
-                            "x86_64-unknown-linux-musl",
-                        };
-                    }
-                },
-                .windows => {
-                    std.io.getStdErr().writeAll("Error [Fatal]: Amd64Windows is broken. Compiler-rt bug that's fixed after 0.13.0.\n") catch unreachable;
-                    return;
-                    //if (default.cpu.arch == .x86_64) {
-                    //    break :blk .{
-                    //        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
-                    //        "x86_64-pc-windows-gnu",
-                    //    };
-                    //}
-                },
-                .macos => {
-                    if (default.cpu.arch == .aarch64) {
-                        break :blk .{
-                            b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
-                            "aarch64-apple-darwin",
-                        };
-                    }
-                    if (default.cpu.arch == .x86_64) {
-                        break :blk .{
-                            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos, .abi = .none }),
-                            "x86_64-apple-darwin",
-                        };
-                    }
-                },
-                else => {},
-            }
-            std.io.getStdErr().writeAll(
-                \\No target provided and none could be selected automatically from default options.
-                \\Please select a target.
-                \\
-                \\  zig build -Dtarget=Amd64Linux
-                \\
-                \\  Options: Amd64Linux, Amd64Windows, Arm64Macos
-                \\
-                \\
-            ) catch unreachable;
-            return;
-        }
-    };
-
+    const target, const rust_target = targetOptions(b);
     const optimize = b.standardOptimizeOption(.{});
 
     // Dependencies.
@@ -222,6 +141,88 @@ pub fn build(b: *std.Build) void {
 
         const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
         test_mwp_step.dependOn(&run_mwp_tests.step);
+    }
+}
+
+fn targetOptions(b: *std.Build) struct { std.Build.ResolvedTarget, []const u8 } {
+    const MinisearchTarget = enum {
+        Amd64Linux,
+        Amd64Windows,
+        Arm64Macos,
+        Amd64Macos,
+    };
+    const target_option = b.option(MinisearchTarget, "target", "Select a supported target");
+    if (target_option) |requested_target| {
+        switch (requested_target) {
+            .Amd64Linux => return .{
+                b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
+                "x86_64-unknown-linux-musl",
+            },
+            .Amd64Windows => {
+                std.io.getStdErr().writeAll("Error [Fatal]: Amd64Windows is broken. Compiler-rt bug that's fixed after 0.13.0.\n") catch unreachable;
+                std.process.exit(0);
+                //return .{
+                //    b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+                //    "x86_64-pc-windows-gnu",
+                //};
+            },
+            .Arm64Macos => return .{
+                b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
+                "aarch64-apple-darwin",
+            },
+            .Amd64Macos => return .{
+                b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos, .abi = .none }),
+                "x86_64-apple-darwin",
+            },
+        }
+    } else {
+        const default = b.host.result;
+        switch (default.os.tag) {
+            .linux => {
+                if (default.cpu.arch == .x86_64) {
+                    return .{
+                        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }),
+                        "x86_64-unknown-linux-musl",
+                    };
+                }
+            },
+            .windows => {
+                std.io.getStdErr().writeAll("Error [Fatal]: Amd64Windows is broken. Compiler-rt bug that's fixed after 0.13.0.\n") catch unreachable;
+                std.process.exit(0);
+                //if (default.cpu.arch == .x86_64) {
+                //    break :blk .{
+                //        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+                //        "x86_64-pc-windows-gnu",
+                //    };
+                //}
+            },
+            .macos => {
+                if (default.cpu.arch == .aarch64) {
+                    return .{
+                        b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos, .abi = .none }),
+                        "aarch64-apple-darwin",
+                    };
+                }
+                if (default.cpu.arch == .x86_64) {
+                    return .{
+                        b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos, .abi = .none }),
+                        "x86_64-apple-darwin",
+                    };
+                }
+            },
+            else => {},
+        }
+        std.io.getStdErr().writeAll(
+            \\No target provided and none could be selected automatically from default options.
+            \\Please select a target.
+            \\
+            \\  zig build -Dtarget=Amd64Linux
+            \\
+            \\  Options: Amd64Linux, Amd64Windows, Arm64Macos
+            \\
+            \\
+        ) catch unreachable;
+        std.process.exit(1);
     }
 }
 

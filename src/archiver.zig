@@ -4,9 +4,257 @@ const SliceArray = @import("lib/slice_array.zig").SliceArray;
 const lzma = @import("lib/lzma.zig");
 const mwp = @import("lib/MediaWikiParser.zig");
 const passes = @import("lib/media_wiki_parser/passes.zig");
-const DuckTrace = @import("lib/tracing.zig").DuckTrace;
+const Tracer = @import("lib/tracing.zig").TestTrace;
 
 const c_allocator = std.heap.c_allocator;
+
+// Config
+pub const BLOCK_SZ_LIMIT: usize = 1_000_000;
+pub const HEADER_SCRATCH_SPACE: usize = 15_000_000;
+comptime {
+    if (@mod(HEADER_SCRATCH_SPACE, 10_000) != 0)
+        @compileError("HEADER_SCRATCH_SPACE must divide by 10,000");
+}
+const MinidumpWriter = struct {
+    const Self = @This();
+
+    a: std.mem.Allocator,
+    lock: std.Thread.Mutex = .{},
+    f: std.fs.File,
+    block_offsets: std.ArrayList(u64),
+    article_id_block_id_map: std.ArrayList(u16),
+
+    cur_block_id: u16,
+    bytes_written: u64,
+
+    pub fn init(out_file_name: []const u8) !Self {
+        var path_buf: [std.fs.MAX_PATH_BYTES]u8 = std.mem.zeroes([std.fs.MAX_PATH_BYTES]u8);
+        const real_path = try std.fs.cwd().realpath(out_file_name, &path_buf);
+        const f = try std.fs.createFileAbsolute(real_path, .{ .truncate = true });
+
+        // Write header scratch space.
+        {
+            const zero_buf: [10_000]u8 = std.mem.zeroes([10_000]u8);
+            for (0..(HEADER_SCRATCH_SPACE / 10_000)) |_| {
+                try f.writeAll(&zero_buf);
+            }
+        }
+
+        return .{
+            .a = c_allocator,
+            .f = f,
+            .block_offsets = try std.ArrayList(u64).initCapacity(c_allocator, std.math.maxInt(u16)),
+            .article_id_block_id_map = try std.ArrayList(u16).initCapacity(c_allocator, 7_500_000),
+            .cur_block_id = 0,
+            .bytes_written = HEADER_SCRATCH_SPACE,
+        };
+    }
+
+    pub fn addBlock(s: *Self, b: Block) void {
+        s.lock.lock();
+        defer s.lock.unlock();
+        _ = b;
+    }
+
+    /// Write prelude and header
+    pub fn finish(s: Self) void {
+        const header_size: u64 = 2 * @sizeOf(u64) + s.block_offsets.items.len * @sizeOf(u64) + s.article_id_block_id_map.items.len * @sizeOf(u16);
+        std.debug.assert(header_size < HEADER_SCRATCH_SPACE);
+        const header_start: u64 = HEADER_SCRATCH_SPACE - header_size;
+
+        try s.f.seekTo(header_start);
+        const header_out_writer = s.f.writer();
+        try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(s.block_offsets.items).len, .big);
+        try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(s.article_id_block_id_map.items).len, .big);
+        try header_out_writer.writeAll(std.mem.sliceAsBytes(s.block_offsets.items));
+        try header_out_writer.writeAll(std.mem.sliceAsBytes(s.article_id_block_id_map.items));
+        std.debug.assert((try s.f.getPos()) == HEADER_SCRATCH_SPACE);
+
+        try s.f.seekTo(0);
+        const prelude_out_writer = s.f.writer();
+        try prelude_out_writer.writeAll("MINIDUMP"); // Magic
+        try prelude_out_writer.writeInt(u64, 0, .big); // Version
+        try prelude_out_writer.writeInt(u64, header_start, .big); // Header Start
+    }
+};
+
+const Block = struct {
+    compressed_data: []const u8,
+    article_ids: []const u32,
+};
+
+var id_counter: u32 = 0;
+const RawArticle = struct {
+    id: u32,
+    text: []const u8,
+
+    /// Not thread safe.
+    pub fn create(text: []const u8) RawArticle {
+        defer id_counter += 1;
+        return .{
+            .id = id_counter,
+            .text = text,
+        };
+    }
+};
+
+pub fn Queue(comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+
+        const RawArticleList = std.DoublyLinkedList(RawArticle);
+        list: RawArticleList = .{},
+        task_buf: [capacity]RawArticleList.Node = std.mem.zeroes([capacity]RawArticleList.Node),
+        free_list: [capacity]bool = [1]bool{true} ** 50,
+
+        mtx: std.Thread.Mutex = .{},
+        /// wait on this to be awakened when space is available
+        full: std.Thread.Condition = .{},
+        /// wait on this to be awakend when something is in the queue
+        empty: std.Thread.Condition = .{},
+
+        pub fn send(s: *Self, article: RawArticle) void {
+            {
+                s.mtx.lock();
+                defer s.mtx.unlock();
+
+                if (s.list.len == s.task_buf.len) {
+                    s.full.wait(&s.mtx);
+                }
+
+                const n = s.allocNode();
+                n.* = .{ .data = article };
+                s.list.prepend(n);
+            }
+            s.empty.signal();
+        }
+
+        pub fn take(s: *Self, article: *RawArticle) void {
+            {
+                s.mtx.lock();
+                defer s.mtx.unlock();
+
+                if (s.list.len == 0) {
+                    s.empty.wait(&s.mtx);
+                }
+
+                const n = s.list.pop() orelse unreachable;
+                article.* = n.data;
+
+                s.freeNode(n);
+            }
+            s.full.signal();
+        }
+
+        /// UB if `s.list.len` >= `s.task_buf.len`
+        fn allocNode(s: *Self) *RawArticleList.Node {
+            for (&s.task_buf, &s.free_list) |*node, *free| {
+                if (free.*) {
+                    free.* = false;
+                    return node;
+                }
+            }
+            unreachable;
+        }
+
+        fn freeNode(s: *Self, n: *RawArticleList.Node) void {
+            const i = @divExact(@intFromPtr(n) - @intFromPtr(&s.task_buf), @sizeOf(RawArticleList.Node));
+            n.* = std.mem.zeroes(RawArticleList.Node);
+            s.free_list[i] = true;
+        }
+    };
+}
+
+const Worker = struct {
+    a: std.mem.Allocator,
+    /// Index into `accum_buf`.
+    i: usize,
+    accum_buf: []u8,
+    out_buf: []u8,
+    minidump: *MinidumpWriter,
+    queue: *Queue(50),
+    ppa: *PagePoolAllocator(60),
+
+    pub fn work(s: *Worker) void {
+        while (true) {
+            var ra: RawArticle = undefined;
+            s.queue.take(&ra);
+            defer s.ppa.releasePage(ra.text) catch @panic("PageNotFound. Slice was edited.");
+
+            var arena = std.heap.ArenaAllocator.init(s.a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const processedText = wikicodeToMarkdown(alloc, ra.text, Tracer(mwp.Error){}, Tracer(passes.Error){}) catch blk: {
+                //stats.n_articles_failed_parsing += 1;
+                break :blk ra.text;
+            };
+            _ = processedText;
+            // add to accum_buf
+            // if it overflows accum_buf,
+            // compress and call `minidump.addBlock`
+        }
+    }
+};
+
+/// TODO: This should accept a runtime `capacity` becuase it depends on the number of workers
+pub fn PagePoolAllocator(comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+
+        mtx: std.Thread.Mutex = .{},
+        slab: []u8,
+        page_buffers: [capacity][]u8 = std.mem.zeroes([capacity][]u8),
+        free_list: [capacity]bool = [1]bool{true} ** capacity,
+
+        pub fn init() !Self {
+            const a = std.heap.page_allocator;
+
+            const slab = try a.alloc(u8, BLOCK_SZ_LIMIT * capacity);
+
+            var s: Self = .{ .slab = slab };
+
+            for (&s.page_buffers, 0..) |*buf, i| {
+                buf.* = slab[i * BLOCK_SZ_LIMIT .. (i + 1) * BLOCK_SZ_LIMIT];
+            }
+
+            return s;
+        }
+
+        /// if the `ptr` or `len` are modified
+        pub fn getPage(s: *Self) error{NoMorePages}![]u8 {
+            s.mtx.lock();
+            defer s.mtx.unlock();
+
+            for (s.page_buffers, &s.free_list) |pbuf, *free| {
+                if (free.*) {
+                    free.* = false;
+                    return pbuf;
+                }
+            }
+
+            return error.NoMorePages;
+        }
+
+        /// `error.PageNotFound` returned when
+        pub fn releasePage(s: *Self, page: []const u8) error{PageNotFound}!void {
+            s.mtx.lock();
+            defer s.mtx.unlock();
+
+            for (s.page_buffers, &s.free_list) |pbuf, *free| {
+                if (pbuf.ptr == page.ptr and pbuf.len == page.len) {
+                    std.debug.assert(!free.*);
+                    free.* = true;
+                }
+            }
+
+            return error.PageNotFound;
+        }
+
+        pub fn deinit(s: *Self) void {
+            std.heap.page_allocator.free(s.slab);
+        }
+    };
+}
 
 pub fn main() !void {
     const args = try Args.parse();
@@ -16,62 +264,46 @@ pub fn main() !void {
     var stdinBR = std.io.bufferedReader(std.io.getStdIn().reader());
     const stdin = stdinBR.reader();
 
-    var out_file = try std.fs.cwd().createFile(args.out_file_name, .{});
-    defer out_file.close();
-    const out = out_file.writer();
+    var minidump = try MinidumpWriter.init(args.out_file_name);
+    var queue: Queue(50) = .{};
+
+    var ppa = try PagePoolAllocator(60).init();
+    defer ppa.deinit();
+
+    const workers = try c_allocator.alloc(Worker, 4);
+    const threads = try c_allocator.alloc(std.Thread, 4);
+
+    for (workers, threads) |*worker, *thread| {
+        worker.* = .{
+            .a = c_allocator,
+            .i = 0,
+            .accum_buf = try c_allocator.alloc(u8, BLOCK_SZ_LIMIT),
+            .out_buf = try c_allocator.alloc(u8, BLOCK_SZ_LIMIT),
+            .minidump = &minidump,
+            .queue = &queue,
+            .ppa = &ppa,
+        };
+        thread.* = try std.Thread.spawn(.{}, Worker.work, .{worker});
+    }
 
     var titles_file = try std.fs.cwd().createFile("titles.txt", .{});
     defer titles_file.close();
     var titlesBW = std.io.bufferedWriter(titles_file.writer());
     const titles = titlesBW.writer();
 
-    const fbaBuffer = try c_allocator.alloc(u8, 4096 * 2048);
-    defer c_allocator.free(fbaBuffer);
-    var fba = std.heap.FixedBufferAllocator.init(fbaBuffer);
-    const fbaAlloc = fba.allocator();
-
-    const page_buffer = try c_allocator.alloc(u8, 4096 * 2048);
-    defer c_allocator.free(page_buffer);
-
-    // Initialize DuckDB tracing.
-    var duckTrace = try DuckTrace.init("logs.db");
-
-    // Write 15MB of 0s
-    const tmp_zero_buf = try fbaAlloc.alloc(u8, 100_000);
-    @memset(tmp_zero_buf, 0);
-    inline for (0..150) |_| {
-        try out.writeAll(tmp_zero_buf);
-    }
-    fbaAlloc.free(tmp_zero_buf);
-
-    // Header
-    var block_offsets = std.ArrayList(u64).init(std.heap.c_allocator);
-    defer block_offsets.deinit();
-    var article_id_block_id_map = std.ArrayList(u16).init(std.heap.c_allocator);
-    defer article_id_block_id_map.deinit();
-
-    // Block
-    var block_id: u16 = 0;
-    var lzma_block_size: usize = 0;
-    var lzma_last_block_size: usize = 0; // we need to know how large the last block was to create an offset for the current one
-    const lzma_block_size_limit: usize = 1_000_000;
-    var lzma_block_accum_buffer = try std.heap.c_allocator.alloc(u8, lzma_block_size_limit);
-    defer std.heap.c_allocator.free(lzma_block_accum_buffer);
-    const lzma_block_out_buffer = try std.heap.c_allocator.alloc(u8, lzma_block_size_limit);
-    defer std.heap.c_allocator.free(lzma_block_out_buffer);
-
-    var document_id: usize = 0;
-    while (document_id < args.n_articles_to_process) {
-        var arena = std.heap.ArenaAllocator.init(fbaAlloc);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-
+    const page_buffer = try c_allocator.alloc(u8, BLOCK_SZ_LIMIT);
+    while (true) {
+        // TODO: Use `page_buffer` to buffer reads.
         const xmlPage = wxmlp.readPage(stdin, page_buffer) catch |err| switch (err) {
             error.EndOfStream => break,
             else => |e| return e,
         };
 
         stats.total_bytes_read += xmlPage.len;
+
+        // TODO: Rather than [XML-parse --> pre-process --> copy --> parse MW-Markup --> codegen passes --> copy],
+        // [XML-parse until MW (<text>), parse MW in place stopping on </text> --> codegen passes --> copy].
+        // Removes one copy step and two scalar scans over the article.
 
         const wikiArticle = wxmlp.parsePage(xmlPage) orelse {
             stats.n_redirects_skipped += 1;
@@ -81,98 +313,127 @@ pub fn main() !void {
         try titles.writeAll(wikiArticle.title);
         try titles.writeByte('\n');
 
-        stats.total_article_bytes_read += wikiArticle.article.len;
+        // Worker owns this.
+        const pp_page_buffer = try ppa.getPage();
 
-        const preProcessedArticle = try preprocessArticle(alloc, wikiArticle.article);
+        const preProcessedArticle = try preprocessArticle(c_allocator, wikiArticle.article, pp_page_buffer);
 
-        var duckTraceDocInstance = duckTrace.newInstance(document_id, preProcessedArticle, mwp.Error);
-        var duckTraceGenInstance = duckTrace.newInstance(document_id, "", passes.Error);
-        duckTraceGenInstance.section = .Parsing;
-        const processedArticle = wikicodeToMarkdown(alloc, preProcessedArticle, &duckTraceDocInstance, &duckTraceGenInstance) catch blk: {
-            stats.n_articles_failed_parsing += 1;
-            break :blk preProcessedArticle;
-        };
-
-        const size_to_write = processedArticle.len + wikiArticle.title.len + @sizeOf(usize) + "# ".len + "\n".len + "0".len;
-
-        if (size_to_write > lzma_block_size_limit) {
-            @panic("Article larger than 1MB found!");
-        }
-
-        // block is full! compress contents and flush them out
-        // add a block_offset to the array
-        if (lzma_block_size + size_to_write >= lzma_block_size_limit) {
-            const compressed_output = try lzma.compress(null, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
-            try out.writeAll(compressed_output);
-
-            if (block_offsets.items.len == 0) {
-                try block_offsets.append(15_000_000);
-            } else {
-                try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + lzma_last_block_size);
-            }
-
-            lzma_last_block_size = compressed_output.len;
-            lzma_block_size = 0;
-            stats.total_bytes_written += compressed_output.len;
-            block_id += 1;
-        }
-
-        var accum_buffer_fbs = std.io.fixedBufferStream(lzma_block_accum_buffer[lzma_block_size..]);
-        const accum_buffer_writer = accum_buffer_fbs.writer();
-
-        try accum_buffer_writer.writeInt(usize, document_id, .big);
-        try accum_buffer_writer.writeAll("# ");
-        try accum_buffer_writer.writeAll(wikiArticle.title);
-        try accum_buffer_writer.writeByte('\n');
-        try accum_buffer_writer.writeAll(processedArticle);
-        try accum_buffer_writer.writeByte(0);
-
-        lzma_block_size += size_to_write;
-
-        // Write down what block this article is in
-        try article_id_block_id_map.append(block_id);
-
-        stats.n_articles_processed += 1;
-        document_id += 1;
+        queue.send(RawArticle.create(preProcessedArticle));
     }
 
-    if (lzma_block_size > 0) {
-        const compressed_output = try lzma.compress(null, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
-        try out.writeAll(compressed_output);
-        lzma_block_size = 0;
-        stats.total_bytes_written += compressed_output.len;
+    //var document_id: usize = 0;
+    //while (document_id < args.n_articles_to_process) {
+    //    var arena = std.heap.ArenaAllocator.init(fbaAlloc);
+    //    defer arena.deinit();
+    //    const alloc = arena.allocator();
 
-        if (block_offsets.items.len == 0) {
-            try block_offsets.append(15_000_000);
-        } else {
-            try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + lzma_last_block_size);
-        }
-    }
+    //    const xmlPage = wxmlp.readPage(stdin, page_buffer) catch |err| switch (err) {
+    //        error.EndOfStream => break,
+    //        else => |e| return e,
+    //    };
 
-    // Write prelude and header
-    const header_size: u64 = 2 * @sizeOf(u64) + block_offsets.items.len * @sizeOf(u64) + article_id_block_id_map.items.len * @sizeOf(u16);
-    std.debug.assert(header_size < 15_000_000);
-    const header_start: u64 = 15_000_000 - header_size;
+    //    stats.total_bytes_read += xmlPage.len;
 
-    try out_file.seekTo(header_start);
-    const header_out_writer = out_file.writer();
-    try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(block_offsets.items).len, .big);
-    try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(article_id_block_id_map.items).len, .big);
-    try header_out_writer.writeAll(std.mem.sliceAsBytes(block_offsets.items));
-    try header_out_writer.writeAll(std.mem.sliceAsBytes(article_id_block_id_map.items));
-    std.debug.assert((try out_file.getPos()) == 15_000_000);
+    //    const wikiArticle = wxmlp.parsePage(xmlPage) orelse {
+    //        stats.n_redirects_skipped += 1;
+    //        continue;
+    //    };
 
-    try out_file.seekTo(0);
-    const prelude_out_writer = out_file.writer();
-    try prelude_out_writer.writeAll("MINIDUMP"); // Magic
-    try prelude_out_writer.writeInt(u64, 0, .big); // Version
-    try prelude_out_writer.writeInt(u64, header_start, .big); // Header Start
+    //    try titles.writeAll(wikiArticle.title);
+    //    try titles.writeByte('\n');
 
-    stats.end_time_ms = std.time.milliTimestamp();
+    //    stats.total_article_bytes_read += wikiArticle.article.len;
 
-    duckTrace.deinit();
+    //    const preProcessedArticle = try preprocessArticle(alloc, wikiArticle.article);
 
-    stats.toStdout();
+    //    var duckTraceDocInstance = duckTrace.newInstance(document_id, preProcessedArticle, mwp.Error);
+    //    var duckTraceGenInstance = duckTrace.newInstance(document_id, "", passes.Error);
+    //    duckTraceGenInstance.section = .Parsing;
+    //    const processedArticle = wikicodeToMarkdown(alloc, preProcessedArticle, &duckTraceDocInstance, &duckTraceGenInstance) catch blk: {
+    //        stats.n_articles_failed_parsing += 1;
+    //        break :blk preProcessedArticle;
+    //    };
+
+    //    const size_to_write = processedArticle.len + wikiArticle.title.len + @sizeOf(usize) + "# ".len + "\n".len + "0".len;
+
+    //    if (size_to_write > lzma_block_size_limit) {
+    //        @panic("Article larger than 1MB found!");
+    //    }
+
+    //    // block is full! compress contents and flush them out
+    //    // add a block_offset to the array
+    //    if (lzma_block_size + size_to_write >= lzma_block_size_limit) {
+    //        const compressed_output = try lzma.compress(null, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
+    //        try out.writeAll(compressed_output);
+
+    //        if (block_offsets.items.len == 0) {
+    //            try block_offsets.append(15_000_000);
+    //        } else {
+    //            try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + lzma_last_block_size);
+    //        }
+
+    //        lzma_last_block_size = compressed_output.len;
+    //        lzma_block_size = 0;
+    //        stats.total_bytes_written += compressed_output.len;
+    //        block_id += 1;
+    //    }
+
+    //    var accum_buffer_fbs = std.io.fixedBufferStream(lzma_block_accum_buffer[lzma_block_size..]);
+    //    const accum_buffer_writer = accum_buffer_fbs.writer();
+
+    //    try accum_buffer_writer.writeInt(usize, document_id, .big);
+    //    try accum_buffer_writer.writeAll("# ");
+    //    try accum_buffer_writer.writeAll(wikiArticle.title);
+    //    try accum_buffer_writer.writeByte('\n');
+    //    try accum_buffer_writer.writeAll(processedArticle);
+    //    try accum_buffer_writer.writeByte(0);
+
+    //    lzma_block_size += size_to_write;
+
+    //    // Write down what block this article is in
+    //    try article_id_block_id_map.append(block_id);
+
+    //    stats.n_articles_processed += 1;
+    //    document_id += 1;
+    //}
+
+    //if (lzma_block_size > 0) {
+    //    const compressed_output = try lzma.compress(null, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
+    //    try out.writeAll(compressed_output);
+    //    lzma_block_size = 0;
+    //    stats.total_bytes_written += compressed_output.len;
+
+    //    if (block_offsets.items.len == 0) {
+    //        try block_offsets.append(15_000_000);
+    //    } else {
+    //        try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + lzma_last_block_size);
+    //    }
+    //}
+
+    //// Write prelude and header
+    //const header_size: u64 = 2 * @sizeOf(u64) + block_offsets.items.len * @sizeOf(u64) + article_id_block_id_map.items.len * @sizeOf(u16);
+    //std.debug.assert(header_size < 15_000_000);
+    //const header_start: u64 = 15_000_000 - header_size;
+
+    //try out_file.seekTo(header_start);
+    //const header_out_writer = out_file.writer();
+    //try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(block_offsets.items).len, .big);
+    //try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(article_id_block_id_map.items).len, .big);
+    //try header_out_writer.writeAll(std.mem.sliceAsBytes(block_offsets.items));
+    //try header_out_writer.writeAll(std.mem.sliceAsBytes(article_id_block_id_map.items));
+    //std.debug.assert((try out_file.getPos()) == 15_000_000);
+
+    //try out_file.seekTo(0);
+    //const prelude_out_writer = out_file.writer();
+    //try prelude_out_writer.writeAll("MINIDUMP"); // Magic
+    //try prelude_out_writer.writeInt(u64, 0, .big); // Version
+    //try prelude_out_writer.writeInt(u64, header_start, .big); // Header Start
+
+    //stats.end_time_ms = std.time.milliTimestamp();
+
+    //duckTrace.deinit();
+
+    //stats.toStdout();
 }
 
 /// Performs substitutions before wikitext can be parsed to an AST
@@ -196,7 +457,7 @@ pub fn main() !void {
 /// `&apos;` to `'`
 ///
 /// delete `\r`
-fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
+fn preprocessArticle(a: std.mem.Allocator, article: []const u8, out: []u8) ![]u8 {
     var sa = SliceArray.init(a);
     defer sa.deinit();
     try sa.append(article);
@@ -211,7 +472,7 @@ fn preprocessArticle(a: std.mem.Allocator, article: []const u8) ![]const u8 {
     try sa.findAndReplace("&apos;", "'");
     try sa.findAndReplace("\r", "");
 
-    return try sa.toSlice();
+    return try sa.writeToSlice(out);
 }
 
 /// Uses `mwp.parseDocument` to convert Wikicode AST to more concise and clean text
@@ -299,7 +560,7 @@ pub const Args = struct {
         const argv0 = sT(std.os.argv[0], 0);
 
         if (std.os.argv.len == 1) {
-            std.debug.print("processing articles until eof\n", .{});
+            try std.io.getStdOut().writeAll("processing articles until eof\n");
             return .{};
         }
 
@@ -311,7 +572,7 @@ pub const Args = struct {
                 return ParseError.Help;
             }
 
-            std.debug.print("processing articles until eof\n", .{});
+            try std.io.getStdOut().writeAll("processing articles until eof\n");
 
             return .{
                 .out_file_name = argv1,

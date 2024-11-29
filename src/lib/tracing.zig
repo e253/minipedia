@@ -7,6 +7,7 @@ pub fn TestTrace(ErrorSet: type) type {
             return E;
         }
         pub fn begin(_: *const Self, _: usize) void {}
+        pub fn success(_: *const Self) !void {}
     };
 }
 
