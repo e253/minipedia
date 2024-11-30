@@ -9,12 +9,14 @@ const Tracer = @import("lib/tracing.zig").TestTrace;
 const c_allocator = std.heap.c_allocator;
 
 // Config
-pub const BLOCK_SZ_LIMIT: usize = 1_000_000;
-pub const HEADER_SCRATCH_SPACE: usize = 15_000_000;
+const MAX_TITLE_BYTES: usize = 256;
+const BLOCK_SZ_LIMIT: usize = 1_000_000;
+const HEADER_SCRATCH_SPACE: usize = 15_000_000;
 comptime {
     if (@mod(HEADER_SCRATCH_SPACE, 10_000) != 0)
         @compileError("HEADER_SCRATCH_SPACE must divide by 10,000");
 }
+
 const MinidumpWriter = struct {
     const Self = @This();
 
@@ -22,7 +24,8 @@ const MinidumpWriter = struct {
     lock: std.Thread.Mutex = .{},
     f: std.fs.File,
     block_offsets: std.ArrayList(u64),
-    article_id_block_id_map: std.ArrayList(u16),
+    article_id_block_id_map: []u16,
+    aid_bid_map_sz: usize = 0,
 
     cur_block_id: u16,
     bytes_written: u64,
@@ -44,7 +47,7 @@ const MinidumpWriter = struct {
             .a = c_allocator,
             .f = f,
             .block_offsets = try std.ArrayList(u64).initCapacity(c_allocator, std.math.maxInt(u16)),
-            .article_id_block_id_map = try std.ArrayList(u16).initCapacity(c_allocator, 7_500_000),
+            .article_id_block_id_map = try c_allocator.alloc(u16, 8_000_000),
             .cur_block_id = 0,
             .bytes_written = HEADER_SCRATCH_SPACE,
         };
@@ -53,21 +56,41 @@ const MinidumpWriter = struct {
     pub fn addBlock(s: *Self, b: Block) void {
         s.lock.lock();
         defer s.lock.unlock();
-        _ = b;
+
+        s.f.writeAll(b.compressed_data) catch @panic("Write Error");
+        s.block_offsets.append(s.bytes_written) catch @panic("OOM");
+        s.bytes_written += b.compressed_data.len;
+
+        for (b.article_ids) |article_id| {
+            if (article_id >= s.article_id_block_id_map.len) {
+                std.debug.print("Article ID ({}) out of bounds\n", .{article_id});
+                std.process.exit(1);
+            }
+            s.article_id_block_id_map[article_id] = s.cur_block_id;
+            if (article_id >= s.aid_bid_map_sz) {
+                s.aid_bid_map_sz = article_id + 1;
+            }
+        }
+
+        s.cur_block_id += 1;
     }
 
     /// Write prelude and header
-    pub fn finish(s: Self) void {
-        const header_size: u64 = 2 * @sizeOf(u64) + s.block_offsets.items.len * @sizeOf(u64) + s.article_id_block_id_map.items.len * @sizeOf(u16);
-        std.debug.assert(header_size < HEADER_SCRATCH_SPACE);
+    pub fn finish(s: Self) !void {
+        const header_size: u64 = 2 * @sizeOf(u64) + s.block_offsets.items.len * @sizeOf(u64) + s.aid_bid_map_sz * @sizeOf(u16);
+        if (header_size > HEADER_SCRATCH_SPACE) {
+            std.debug.print("header size, {}, larger than HEADER_SCRATCH_SPACE, {}\n", .{ header_size, HEADER_SCRATCH_SPACE });
+            std.process.exit(1);
+        }
+
         const header_start: u64 = HEADER_SCRATCH_SPACE - header_size;
 
         try s.f.seekTo(header_start);
         const header_out_writer = s.f.writer();
         try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(s.block_offsets.items).len, .big);
-        try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(s.article_id_block_id_map.items).len, .big);
+        try header_out_writer.writeInt(u64, s.aid_bid_map_sz * @sizeOf(u16), .big);
         try header_out_writer.writeAll(std.mem.sliceAsBytes(s.block_offsets.items));
-        try header_out_writer.writeAll(std.mem.sliceAsBytes(s.article_id_block_id_map.items));
+        try header_out_writer.writeAll(std.mem.sliceAsBytes(s.article_id_block_id_map[0..s.aid_bid_map_sz]));
         std.debug.assert((try s.f.getPos()) == HEADER_SCRATCH_SPACE);
 
         try s.f.seekTo(0);
@@ -83,19 +106,12 @@ const Block = struct {
     article_ids: []const u32,
 };
 
-var id_counter: u32 = 0;
 const RawArticle = struct {
     id: u32,
+    /// libc allocated
+    title: []const u8,
+    /// PPA allocated
     text: []const u8,
-
-    /// Not thread safe.
-    pub fn create(text: []const u8) RawArticle {
-        defer id_counter += 1;
-        return .{
-            .id = id_counter,
-            .text = text,
-        };
-    }
 };
 
 pub fn Queue(comptime capacity: usize) type {
@@ -107,6 +123,8 @@ pub fn Queue(comptime capacity: usize) type {
         task_buf: [capacity]RawArticleList.Node = std.mem.zeroes([capacity]RawArticleList.Node),
         free_list: [capacity]bool = [1]bool{true} ** 50,
 
+        stop: bool = false,
+
         mtx: std.Thread.Mutex = .{},
         /// wait on this to be awakened when space is available
         full: std.Thread.Condition = .{},
@@ -114,36 +132,32 @@ pub fn Queue(comptime capacity: usize) type {
         empty: std.Thread.Condition = .{},
 
         pub fn send(s: *Self, article: RawArticle) void {
-            {
+            while (true) {
                 s.mtx.lock();
                 defer s.mtx.unlock();
 
-                if (s.list.len == s.task_buf.len) {
-                    s.full.wait(&s.mtx);
+                if (s.list.len < capacity) {
+                    const n = s.allocNode();
+                    n.* = .{ .data = article };
+                    s.list.prepend(n);
+                    return;
                 }
-
-                const n = s.allocNode();
-                n.* = .{ .data = article };
-                s.list.prepend(n);
             }
-            s.empty.signal();
         }
 
-        pub fn take(s: *Self, article: *RawArticle) void {
-            {
+        pub fn take(s: *Self) ?RawArticle {
+            while (true) {
                 s.mtx.lock();
                 defer s.mtx.unlock();
 
-                if (s.list.len == 0) {
-                    s.empty.wait(&s.mtx);
+                if (s.list.len > 0) {
+                    const n = s.list.pop() orelse unreachable;
+                    defer s.freeNode(n);
+                    return n.data;
+                } else if (s.stop) {
+                    return null;
                 }
-
-                const n = s.list.pop() orelse unreachable;
-                article.* = n.data;
-
-                s.freeNode(n);
             }
-            s.full.signal();
         }
 
         /// UB if `s.list.len` >= `s.task_buf.len`
@@ -166,33 +180,88 @@ pub fn Queue(comptime capacity: usize) type {
 }
 
 const Worker = struct {
+    worker_id: u16,
     a: std.mem.Allocator,
     /// Index into `accum_buf`.
     i: usize,
     accum_buf: []u8,
     out_buf: []u8,
+    article_ids: std.ArrayList(u32),
     minidump: *MinidumpWriter,
     queue: *Queue(50),
     ppa: *PagePoolAllocator(60),
+    progress: std.Progress.Node,
+    stats: *Stats,
 
     pub fn work(s: *Worker) void {
         while (true) {
-            var ra: RawArticle = undefined;
-            s.queue.take(&ra);
+            const ra = s.queue.take() orelse break;
             defer s.ppa.releasePage(ra.text) catch @panic("PageNotFound. Slice was edited.");
+            defer c_allocator.free(ra.title);
 
             var arena = std.heap.ArenaAllocator.init(s.a);
             defer arena.deinit();
             const alloc = arena.allocator();
-            const processedText = wikicodeToMarkdown(alloc, ra.text, Tracer(mwp.Error){}, Tracer(passes.Error){}) catch blk: {
-                //stats.n_articles_failed_parsing += 1;
-                break :blk ra.text;
-            };
-            _ = processedText;
-            // add to accum_buf
-            // if it overflows accum_buf,
-            // compress and call `minidump.addBlock`
+            const processedText = wikicodeToMarkdown(alloc, ra.text, Tracer(mwp.Error){}, Tracer(passes.Error){}) catch ra.text;
+
+            const size_to_write = processedText.len + ra.title.len + @sizeOf(usize) + "# ".len + "\n".len + "0".len;
+
+            if (size_to_write > BLOCK_SZ_LIMIT) {
+                @panic("Article larger than 1MB found!");
+            }
+
+            if (s.i + size_to_write > BLOCK_SZ_LIMIT) {
+                const compressed_data = lzma.compress(null, s.accum_buf, s.out_buf) catch |err| {
+                    std.debug.print("LZMA Compression Error: {s}\n", .{@errorName(err)});
+                    std.process.exit(1);
+                };
+
+                s.minidump.addBlock(.{
+                    .compressed_data = compressed_data,
+                    .article_ids = s.article_ids.items,
+                });
+
+                s.i = 0;
+                s.article_ids.clearRetainingCapacity();
+            }
+
+            var accum_buffer_fbs = std.io.fixedBufferStream(s.accum_buf[s.i..]);
+            const accum_buffer_writer = accum_buffer_fbs.writer();
+
+            accum_buffer_writer.writeInt(usize, ra.id, .big) catch unreachable;
+            accum_buffer_writer.writeAll("# ") catch unreachable;
+            accum_buffer_writer.writeAll(ra.title) catch unreachable;
+            accum_buffer_writer.writeByte('\n') catch unreachable;
+            accum_buffer_writer.writeAll(processedText) catch unreachable;
+            accum_buffer_writer.writeByte(0) catch unreachable;
+
+            s.i += size_to_write;
+            s.article_ids.append(ra.id) catch @panic("OOM");
+
+            s.progress.completeOne();
+            _ = @atomicRmw(usize, &s.stats.n_articles_processed, .Add, 1, .monotonic);
         }
+
+        if (s.i > 0) {
+            const compressed_data = lzma.compress(null, s.accum_buf, s.out_buf) catch |err| {
+                std.debug.print("LZMA Compression Error: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+
+            _ = @atomicRmw(usize, &s.stats.total_bytes_written, .Add, compressed_data.len, .monotonic);
+
+            s.minidump.addBlock(.{
+                .compressed_data = compressed_data,
+                .article_ids = s.article_ids.items,
+            });
+
+            s.i = 0;
+            s.article_ids.clearRetainingCapacity();
+        }
+
+        s.a.free(s.accum_buf);
+        s.a.free(s.out_buf);
+        s.article_ids.deinit();
     }
 };
 
@@ -241,9 +310,10 @@ pub fn PagePoolAllocator(comptime capacity: usize) type {
             defer s.mtx.unlock();
 
             for (s.page_buffers, &s.free_list) |pbuf, *free| {
-                if (pbuf.ptr == page.ptr and pbuf.len == page.len) {
+                if (pbuf.ptr == page.ptr) {
                     std.debug.assert(!free.*);
                     free.* = true;
+                    return;
                 }
             }
 
@@ -270,18 +340,29 @@ pub fn main() !void {
     var ppa = try PagePoolAllocator(60).init();
     defer ppa.deinit();
 
-    const workers = try c_allocator.alloc(Worker, 4);
-    const threads = try c_allocator.alloc(std.Thread, 4);
+    const global_progress = std.Progress.start(.{});
+    defer global_progress.end();
+    const progress = global_progress.start("Article Procressing", args.n_articles_to_process);
+    defer progress.end();
 
-    for (workers, threads) |*worker, *thread| {
+    const workers = try c_allocator.alloc(Worker, 4);
+    defer c_allocator.free(workers);
+    const threads = try c_allocator.alloc(std.Thread, 4);
+    defer c_allocator.free(threads);
+
+    for (workers, threads, 0..) |*worker, *thread, i| {
         worker.* = .{
+            .worker_id = @intCast(i),
             .a = c_allocator,
             .i = 0,
             .accum_buf = try c_allocator.alloc(u8, BLOCK_SZ_LIMIT),
             .out_buf = try c_allocator.alloc(u8, BLOCK_SZ_LIMIT),
+            .article_ids = try std.ArrayList(u32).initCapacity(c_allocator, 500),
             .minidump = &minidump,
             .queue = &queue,
             .ppa = &ppa,
+            .progress = progress,
+            .stats = &stats,
         };
         thread.* = try std.Thread.spawn(.{}, Worker.work, .{worker});
     }
@@ -292,7 +373,8 @@ pub fn main() !void {
     const titles = titlesBW.writer();
 
     const page_buffer = try c_allocator.alloc(u8, BLOCK_SZ_LIMIT);
-    while (true) {
+    var article_id: u32 = 0;
+    while (article_id < args.n_articles_to_process) {
         // TODO: Use `page_buffer` to buffer reads.
         const xmlPage = wxmlp.readPage(stdin, page_buffer) catch |err| switch (err) {
             error.EndOfStream => break,
@@ -313,13 +395,28 @@ pub fn main() !void {
         try titles.writeAll(wikiArticle.title);
         try titles.writeByte('\n');
 
-        // Worker owns this.
+        stats.total_article_bytes_read += wikiArticle.article.len;
+
         const pp_page_buffer = try ppa.getPage();
 
         const preProcessedArticle = try preprocessArticle(c_allocator, wikiArticle.article, pp_page_buffer);
+        const title = c_allocator.dupe(u8, wikiArticle.title) catch @panic("OOM");
 
-        queue.send(RawArticle.create(preProcessedArticle));
+        const ra: RawArticle = .{ .id = article_id, .text = preProcessedArticle, .title = title };
+        article_id += 1;
+
+        queue.send(ra);
     }
+
+    queue.stop = true;
+
+    for (threads) |t| t.join();
+
+    stats.end_time_ms = std.time.milliTimestamp();
+
+    stats.toStdout();
+
+    try minidump.finish();
 
     //var document_id: usize = 0;
     //while (document_id < args.n_articles_to_process) {
@@ -509,21 +606,21 @@ pub const Stats = struct {
     total_bytes_written: usize = 0,
     n_articles_processed: usize = 0,
     n_redirects_skipped: usize = 0,
-    n_articles_failed_parsing: usize = 0,
     start_time_ms: i64 = 0,
     end_time_ms: i64 = 0,
 
     pub fn toStdout(this: *Stats) void {
         const stdout = std.io.getStdOut().writer();
 
-        stdout.print("Processed {} articles, skipped {} redirects and {} parsing errors\n", .{ this.n_articles_processed, this.n_redirects_skipped, this.n_articles_failed_parsing }) catch unreachable;
+        stdout.print("Processed {} articles, skipped {} redirects\n", .{ this.n_articles_processed, this.n_redirects_skipped }) catch unreachable;
 
         stdout.print("Read {d} MB. Avg article len {d} KB\n", .{
             tof32(this.total_bytes_read) / 1_000_000.0,
             tof32(this.total_article_bytes_read) / tof32(this.n_articles_processed) / 1_000.0,
         }) catch unreachable;
 
-        stdout.print("Wrote 15 (header) + {d} MB. Avg article len {d} KB\n", .{
+        stdout.print("Wrote {} (header) + {d} MB. Avg article size {d} KB\n", .{
+            HEADER_SCRATCH_SPACE / 1_000_000,
             tof32(this.total_bytes_written) / 1_000_000.0,
             tof32(this.total_bytes_written) / tof32(this.n_articles_processed) / 1_000.0,
         }) catch unreachable;
