@@ -100,7 +100,7 @@ fn spa(_: State, req: *httpz.Request, res: *httpz.Response) !void {
 fn contentTypeFromPath(path: []const u8) httpz.ContentType {
     const ext_type_pairs = [_]struct { []const u8, httpz.ContentType }{
         .{ ".js", .JS },
-        .{ ".html", .JS },
+        .{ ".html", .HTML },
     };
 
     inline for (ext_type_pairs) |pair| {

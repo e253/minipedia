@@ -114,67 +114,46 @@ const RawArticle = struct {
     text: []const u8,
 };
 
-pub fn Queue(comptime capacity: usize) type {
+pub fn MPMCQueue(T: type, comptime capacity: usize) type {
     return struct {
         const Self = @This();
 
-        const RawArticleList = std.DoublyLinkedList(RawArticle);
-        list: RawArticleList = .{},
-        task_buf: [capacity]RawArticleList.Node = std.mem.zeroes([capacity]RawArticleList.Node),
-        free_list: [capacity]bool = [1]bool{true} ** 50,
+        const Slot = struct {
+            turn: std.atomic.Value(usize),
+            item: T,
+        };
+
+        slots: [capacity]Slot = std.mem.zeroes([capacity]Slot),
+        head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
         stop: bool = false,
 
-        mtx: std.Thread.Mutex = .{},
-        /// wait on this to be awakened when space is available
-        full: std.Thread.Condition = .{},
-        /// wait on this to be awakend when something is in the queue
-        empty: std.Thread.Condition = .{},
+        pub fn send(s: *Self, item: T) void {
+            const write_ticket = s.head.fetchAdd(1, .seq_cst);
 
-        pub fn send(s: *Self, article: RawArticle) void {
-            while (true) {
-                s.mtx.lock();
-                defer s.mtx.unlock();
+            const slot = &s.slots[write_ticket % capacity];
+            const turn = 2 * (write_ticket / capacity);
 
-                if (s.list.len < capacity) {
-                    const n = s.allocNode();
-                    n.* = .{ .data = article };
-                    s.list.prepend(n);
-                    return;
-                }
-            }
+            while (turn != slot.turn.load(.acquire)) {}
+
+            (&slot.item).* = item;
+            slot.turn.store(turn + 1, .release);
         }
 
-        pub fn take(s: *Self) ?RawArticle {
-            while (true) {
-                s.mtx.lock();
-                defer s.mtx.unlock();
+        /// `null` means no more items are coming
+        pub fn take(s: *Self) ?T {
+            const read_ticket = s.tail.fetchAdd(1, .seq_cst);
 
-                if (s.list.len > 0) {
-                    const n = s.list.pop() orelse unreachable;
-                    defer s.freeNode(n);
-                    return n.data;
-                } else if (s.stop) {
-                    return null;
-                }
+            const slot = &s.slots[read_ticket % capacity];
+            const turn = 2 * (read_ticket / capacity) + 1;
+
+            while (turn != slot.turn.load(.acquire)) {
+                if (s.stop) return null;
             }
-        }
 
-        /// UB if `s.list.len` >= `s.task_buf.len`
-        fn allocNode(s: *Self) *RawArticleList.Node {
-            for (&s.task_buf, &s.free_list) |*node, *free| {
-                if (free.*) {
-                    free.* = false;
-                    return node;
-                }
-            }
-            unreachable;
-        }
-
-        fn freeNode(s: *Self, n: *RawArticleList.Node) void {
-            const i = @divExact(@intFromPtr(n) - @intFromPtr(&s.task_buf), @sizeOf(RawArticleList.Node));
-            n.* = std.mem.zeroes(RawArticleList.Node);
-            s.free_list[i] = true;
+            defer slot.turn.store(turn + 1, .release);
+            return slot.item;
         }
     };
 }
@@ -188,8 +167,8 @@ const Worker = struct {
     out_buf: []u8,
     article_ids: std.ArrayList(u32),
     minidump: *MinidumpWriter,
-    queue: *Queue(50),
-    ppa: *PagePoolAllocator(60),
+    queue: *MPMCQueue(RawArticle, 50),
+    ppa: *PagePoolAllocator,
     progress: std.Progress.Node,
     stats: *Stats,
 
@@ -265,66 +244,71 @@ const Worker = struct {
     }
 };
 
-/// TODO: This should accept a runtime `capacity` becuase it depends on the number of workers
-pub fn PagePoolAllocator(comptime capacity: usize) type {
-    return struct {
-        const Self = @This();
+const PagePoolAllocator = struct {
+    const Self = @This();
 
-        mtx: std.Thread.Mutex = .{},
-        slab: []u8,
-        page_buffers: [capacity][]u8 = std.mem.zeroes([capacity][]u8),
-        free_list: [capacity]bool = [1]bool{true} ** capacity,
+    mtx: std.Thread.Mutex = .{},
+    slab: []u8,
+    page_buffers: [][]u8,
+    free_list: []bool,
 
-        pub fn init() !Self {
-            const a = std.heap.page_allocator;
+    pub fn init(capacity: usize) !Self {
+        const a = std.heap.page_allocator;
 
-            const slab = try a.alloc(u8, BLOCK_SZ_LIMIT * capacity);
+        const slab = try a.alloc(u8, BLOCK_SZ_LIMIT * capacity);
 
-            var s: Self = .{ .slab = slab };
+        const page_buffers: [][]u8 = try c_allocator.alloc([]u8, capacity);
+        const free_list: []bool = try c_allocator.alloc(bool, capacity);
 
-            for (&s.page_buffers, 0..) |*buf, i| {
-                buf.* = slab[i * BLOCK_SZ_LIMIT .. (i + 1) * BLOCK_SZ_LIMIT];
+        for (page_buffers, 0..) |*buf, i| {
+            buf.* = slab[i * BLOCK_SZ_LIMIT .. (i + 1) * BLOCK_SZ_LIMIT];
+        }
+        for (free_list) |*free| free.* = true;
+
+        return .{
+            .slab = slab,
+            .page_buffers = page_buffers,
+            .free_list = free_list,
+        };
+    }
+
+    /// if the `ptr` or `len` are modified
+    pub fn getPage(s: *Self) error{NoMorePages}![]u8 {
+        s.mtx.lock();
+        defer s.mtx.unlock();
+
+        for (s.page_buffers, s.free_list) |pbuf, *free| {
+            if (free.*) {
+                free.* = false;
+                return pbuf;
             }
-
-            return s;
         }
 
-        /// if the `ptr` or `len` are modified
-        pub fn getPage(s: *Self) error{NoMorePages}![]u8 {
-            s.mtx.lock();
-            defer s.mtx.unlock();
+        return error.NoMorePages;
+    }
 
-            for (s.page_buffers, &s.free_list) |pbuf, *free| {
-                if (free.*) {
-                    free.* = false;
-                    return pbuf;
-                }
+    /// `error.PageNotFound` returned when
+    pub fn releasePage(s: *Self, page: []const u8) error{PageNotFound}!void {
+        s.mtx.lock();
+        defer s.mtx.unlock();
+
+        for (s.page_buffers, s.free_list) |pbuf, *free| {
+            if (pbuf.ptr == page.ptr) {
+                std.debug.assert(!free.*);
+                free.* = true;
+                return;
             }
-
-            return error.NoMorePages;
         }
 
-        /// `error.PageNotFound` returned when
-        pub fn releasePage(s: *Self, page: []const u8) error{PageNotFound}!void {
-            s.mtx.lock();
-            defer s.mtx.unlock();
+        return error.PageNotFound;
+    }
 
-            for (s.page_buffers, &s.free_list) |pbuf, *free| {
-                if (pbuf.ptr == page.ptr) {
-                    std.debug.assert(!free.*);
-                    free.* = true;
-                    return;
-                }
-            }
-
-            return error.PageNotFound;
-        }
-
-        pub fn deinit(s: *Self) void {
-            std.heap.page_allocator.free(s.slab);
-        }
-    };
-}
+    pub fn deinit(s: *Self) void {
+        std.heap.page_allocator.free(s.slab);
+        c_allocator.free(s.page_buffers);
+        c_allocator.free(s.free_list);
+    }
+};
 
 pub fn main() !void {
     const args = try Args.parse();
@@ -335,9 +319,9 @@ pub fn main() !void {
     const stdin = stdinBR.reader();
 
     var minidump = try MinidumpWriter.init(args.out_file_name);
-    var queue: Queue(50) = .{};
+    var queue: MPMCQueue(RawArticle, 50) = .{};
 
-    var ppa = try PagePoolAllocator(60).init();
+    var ppa = try PagePoolAllocator.init(50 + 4 + 1);
     defer ppa.deinit();
 
     const global_progress = std.Progress.start(.{});
@@ -387,6 +371,8 @@ pub fn main() !void {
         // [XML-parse until MW (<text>), parse MW in place stopping on </text> --> codegen passes --> copy].
         // Removes one copy step and two scalar scans over the article.
 
+        // TODO: This and below should be done in each worker.
+        // Rapidxml memory pool is not thread safe.
         const wikiArticle = wxmlp.parsePage(xmlPage) orelse {
             stats.n_redirects_skipped += 1;
             continue;
