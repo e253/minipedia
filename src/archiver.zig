@@ -5,6 +5,8 @@ const lzma = @import("lib/lzma.zig");
 const mwp = @import("lib/MediaWikiParser.zig");
 const passes = @import("lib/media_wiki_parser/passes.zig");
 const Tracer = @import("lib/tracing.zig").TestTrace;
+const MPMCQueue = @import("lib/mpmc_queue.zig").MPMCQueue;
+const BufferPool = @import("lib/mpmc_queue.zig").BufferPool;
 
 const c_allocator = std.heap.c_allocator;
 
@@ -16,6 +18,8 @@ comptime {
     if (@mod(HEADER_SCRATCH_SPACE, 10_000) != 0)
         @compileError("HEADER_SCRATCH_SPACE must divide by 10,000");
 }
+
+const Queue = MPMCQueue(?RawArticle, 50);
 
 const MinidumpWriter = struct {
     const Self = @This();
@@ -114,50 +118,6 @@ const RawArticle = struct {
     text: []const u8,
 };
 
-pub fn MPMCQueue(T: type, comptime capacity: usize) type {
-    return struct {
-        const Self = @This();
-
-        const Slot = struct {
-            turn: std.atomic.Value(usize),
-            item: T,
-        };
-
-        slots: [capacity]Slot = std.mem.zeroes([capacity]Slot),
-        head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-        tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-
-        stop: bool = false,
-
-        pub fn send(s: *Self, item: T) void {
-            const write_ticket = s.head.fetchAdd(1, .seq_cst);
-
-            const slot = &s.slots[write_ticket % capacity];
-            const turn = 2 * (write_ticket / capacity);
-
-            while (turn != slot.turn.load(.acquire)) {}
-
-            (&slot.item).* = item;
-            slot.turn.store(turn + 1, .release);
-        }
-
-        /// `null` means no more items are coming
-        pub fn take(s: *Self) ?T {
-            const read_ticket = s.tail.fetchAdd(1, .seq_cst);
-
-            const slot = &s.slots[read_ticket % capacity];
-            const turn = 2 * (read_ticket / capacity) + 1;
-
-            while (turn != slot.turn.load(.acquire)) {
-                if (s.stop) return null;
-            }
-
-            defer slot.turn.store(turn + 1, .release);
-            return slot.item;
-        }
-    };
-}
-
 const Worker = struct {
     worker_id: u16,
     a: std.mem.Allocator,
@@ -167,15 +127,15 @@ const Worker = struct {
     out_buf: []u8,
     article_ids: std.ArrayList(u32),
     minidump: *MinidumpWriter,
-    queue: *MPMCQueue(RawArticle, 50),
-    ppa: *PagePoolAllocator,
+    queue: *Queue,
+    ppa: *BufferPool,
     progress: std.Progress.Node,
     stats: *Stats,
 
     pub fn work(s: *Worker) void {
         while (true) {
             const ra = s.queue.take() orelse break;
-            defer s.ppa.releasePage(ra.text) catch @panic("PageNotFound. Slice was edited.");
+            defer s.ppa.releaseBuffer(ra.text);
             defer c_allocator.free(ra.title);
 
             var arena = std.heap.ArenaAllocator.init(s.a);
@@ -244,72 +204,6 @@ const Worker = struct {
     }
 };
 
-const PagePoolAllocator = struct {
-    const Self = @This();
-
-    mtx: std.Thread.Mutex = .{},
-    slab: []u8,
-    page_buffers: [][]u8,
-    free_list: []bool,
-
-    pub fn init(capacity: usize) !Self {
-        const a = std.heap.page_allocator;
-
-        const slab = try a.alloc(u8, BLOCK_SZ_LIMIT * capacity);
-
-        const page_buffers: [][]u8 = try c_allocator.alloc([]u8, capacity);
-        const free_list: []bool = try c_allocator.alloc(bool, capacity);
-
-        for (page_buffers, 0..) |*buf, i| {
-            buf.* = slab[i * BLOCK_SZ_LIMIT .. (i + 1) * BLOCK_SZ_LIMIT];
-        }
-        for (free_list) |*free| free.* = true;
-
-        return .{
-            .slab = slab,
-            .page_buffers = page_buffers,
-            .free_list = free_list,
-        };
-    }
-
-    /// if the `ptr` or `len` are modified
-    pub fn getPage(s: *Self) error{NoMorePages}![]u8 {
-        s.mtx.lock();
-        defer s.mtx.unlock();
-
-        for (s.page_buffers, s.free_list) |pbuf, *free| {
-            if (free.*) {
-                free.* = false;
-                return pbuf;
-            }
-        }
-
-        return error.NoMorePages;
-    }
-
-    /// `error.PageNotFound` returned when
-    pub fn releasePage(s: *Self, page: []const u8) error{PageNotFound}!void {
-        s.mtx.lock();
-        defer s.mtx.unlock();
-
-        for (s.page_buffers, s.free_list) |pbuf, *free| {
-            if (pbuf.ptr == page.ptr) {
-                std.debug.assert(!free.*);
-                free.* = true;
-                return;
-            }
-        }
-
-        return error.PageNotFound;
-    }
-
-    pub fn deinit(s: *Self) void {
-        std.heap.page_allocator.free(s.slab);
-        c_allocator.free(s.page_buffers);
-        c_allocator.free(s.free_list);
-    }
-};
-
 pub fn main() !void {
     const args = try Args.parse();
 
@@ -319,10 +213,10 @@ pub fn main() !void {
     const stdin = stdinBR.reader();
 
     var minidump = try MinidumpWriter.init(args.out_file_name);
-    var queue: MPMCQueue(RawArticle, 50) = .{};
+    var queue: Queue = .{};
 
-    var ppa = try PagePoolAllocator.init(50 + 4 + 1);
-    defer ppa.deinit();
+    var page_pool = try BufferPool.init(c_allocator, 50 + 4 + 1, BLOCK_SZ_LIMIT);
+    defer page_pool.deinit();
 
     const global_progress = std.Progress.start(.{});
     defer global_progress.end();
@@ -344,7 +238,7 @@ pub fn main() !void {
             .article_ids = try std.ArrayList(u32).initCapacity(c_allocator, 500),
             .minidump = &minidump,
             .queue = &queue,
-            .ppa = &ppa,
+            .ppa = &page_pool,
             .progress = progress,
             .stats = &stats,
         };
@@ -383,7 +277,7 @@ pub fn main() !void {
 
         stats.total_article_bytes_read += wikiArticle.article.len;
 
-        const pp_page_buffer = try ppa.getPage();
+        const pp_page_buffer = page_pool.acquireBuffer();
 
         const preProcessedArticle = try preprocessArticle(c_allocator, wikiArticle.article, pp_page_buffer);
         const title = c_allocator.dupe(u8, wikiArticle.title) catch @panic("OOM");
@@ -394,129 +288,14 @@ pub fn main() !void {
         queue.send(ra);
     }
 
-    queue.stop = true;
-
+    for (threads) |_| queue.send(null);
     for (threads) |t| t.join();
 
     stats.end_time_ms = std.time.milliTimestamp();
 
-    stats.toStdout();
-
     try minidump.finish();
 
-    //var document_id: usize = 0;
-    //while (document_id < args.n_articles_to_process) {
-    //    var arena = std.heap.ArenaAllocator.init(fbaAlloc);
-    //    defer arena.deinit();
-    //    const alloc = arena.allocator();
-
-    //    const xmlPage = wxmlp.readPage(stdin, page_buffer) catch |err| switch (err) {
-    //        error.EndOfStream => break,
-    //        else => |e| return e,
-    //    };
-
-    //    stats.total_bytes_read += xmlPage.len;
-
-    //    const wikiArticle = wxmlp.parsePage(xmlPage) orelse {
-    //        stats.n_redirects_skipped += 1;
-    //        continue;
-    //    };
-
-    //    try titles.writeAll(wikiArticle.title);
-    //    try titles.writeByte('\n');
-
-    //    stats.total_article_bytes_read += wikiArticle.article.len;
-
-    //    const preProcessedArticle = try preprocessArticle(alloc, wikiArticle.article);
-
-    //    var duckTraceDocInstance = duckTrace.newInstance(document_id, preProcessedArticle, mwp.Error);
-    //    var duckTraceGenInstance = duckTrace.newInstance(document_id, "", passes.Error);
-    //    duckTraceGenInstance.section = .Parsing;
-    //    const processedArticle = wikicodeToMarkdown(alloc, preProcessedArticle, &duckTraceDocInstance, &duckTraceGenInstance) catch blk: {
-    //        stats.n_articles_failed_parsing += 1;
-    //        break :blk preProcessedArticle;
-    //    };
-
-    //    const size_to_write = processedArticle.len + wikiArticle.title.len + @sizeOf(usize) + "# ".len + "\n".len + "0".len;
-
-    //    if (size_to_write > lzma_block_size_limit) {
-    //        @panic("Article larger than 1MB found!");
-    //    }
-
-    //    // block is full! compress contents and flush them out
-    //    // add a block_offset to the array
-    //    if (lzma_block_size + size_to_write >= lzma_block_size_limit) {
-    //        const compressed_output = try lzma.compress(null, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
-    //        try out.writeAll(compressed_output);
-
-    //        if (block_offsets.items.len == 0) {
-    //            try block_offsets.append(15_000_000);
-    //        } else {
-    //            try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + lzma_last_block_size);
-    //        }
-
-    //        lzma_last_block_size = compressed_output.len;
-    //        lzma_block_size = 0;
-    //        stats.total_bytes_written += compressed_output.len;
-    //        block_id += 1;
-    //    }
-
-    //    var accum_buffer_fbs = std.io.fixedBufferStream(lzma_block_accum_buffer[lzma_block_size..]);
-    //    const accum_buffer_writer = accum_buffer_fbs.writer();
-
-    //    try accum_buffer_writer.writeInt(usize, document_id, .big);
-    //    try accum_buffer_writer.writeAll("# ");
-    //    try accum_buffer_writer.writeAll(wikiArticle.title);
-    //    try accum_buffer_writer.writeByte('\n');
-    //    try accum_buffer_writer.writeAll(processedArticle);
-    //    try accum_buffer_writer.writeByte(0);
-
-    //    lzma_block_size += size_to_write;
-
-    //    // Write down what block this article is in
-    //    try article_id_block_id_map.append(block_id);
-
-    //    stats.n_articles_processed += 1;
-    //    document_id += 1;
-    //}
-
-    //if (lzma_block_size > 0) {
-    //    const compressed_output = try lzma.compress(null, lzma_block_accum_buffer[0..lzma_block_size], lzma_block_out_buffer);
-    //    try out.writeAll(compressed_output);
-    //    lzma_block_size = 0;
-    //    stats.total_bytes_written += compressed_output.len;
-
-    //    if (block_offsets.items.len == 0) {
-    //        try block_offsets.append(15_000_000);
-    //    } else {
-    //        try block_offsets.append(block_offsets.items[block_offsets.items.len - 1] + lzma_last_block_size);
-    //    }
-    //}
-
-    //// Write prelude and header
-    //const header_size: u64 = 2 * @sizeOf(u64) + block_offsets.items.len * @sizeOf(u64) + article_id_block_id_map.items.len * @sizeOf(u16);
-    //std.debug.assert(header_size < 15_000_000);
-    //const header_start: u64 = 15_000_000 - header_size;
-
-    //try out_file.seekTo(header_start);
-    //const header_out_writer = out_file.writer();
-    //try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(block_offsets.items).len, .big);
-    //try header_out_writer.writeInt(u64, std.mem.sliceAsBytes(article_id_block_id_map.items).len, .big);
-    //try header_out_writer.writeAll(std.mem.sliceAsBytes(block_offsets.items));
-    //try header_out_writer.writeAll(std.mem.sliceAsBytes(article_id_block_id_map.items));
-    //std.debug.assert((try out_file.getPos()) == 15_000_000);
-
-    //try out_file.seekTo(0);
-    //const prelude_out_writer = out_file.writer();
-    //try prelude_out_writer.writeAll("MINIDUMP"); // Magic
-    //try prelude_out_writer.writeInt(u64, 0, .big); // Version
-    //try prelude_out_writer.writeInt(u64, header_start, .big); // Header Start
-
-    //stats.end_time_ms = std.time.milliTimestamp();
-
-    //duckTrace.deinit();
-
-    //stats.toStdout();
+    stats.toStdout();
 }
 
 /// Performs substitutions before wikitext can be parsed to an AST
