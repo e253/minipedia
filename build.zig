@@ -142,6 +142,24 @@ pub fn build(b: *std.Build) void {
         const test_mwp_step = b.step("test-mwp", "Run MediaWikiParser Test Suite");
         test_mwp_step.dependOn(&run_mwp_tests.step);
     }
+
+    const bench = b.option(bool, "bench", "Build and run benchmarks") orelse false;
+    if (bench) {
+        const preproc_benchmark_exe = b.addExecutable(.{
+            .name = "bench_preprocess",
+            .root_source_file = b.path("src/bench/preprocess.zig"),
+            .optimize = .ReleaseFast,
+            .target = b.host,
+            .link_libc = true,
+        });
+        preproc_benchmark_exe.root_module.addImport(
+            "slice_array",
+            b.addModule("slice_array", .{
+                .root_source_file = b.path("src/lib/slice_array.zig"),
+            }),
+        );
+        b.installArtifact(preproc_benchmark_exe);
+    }
 }
 
 fn targetOptions(b: *std.Build) struct { std.Build.ResolvedTarget, []const u8 } {
